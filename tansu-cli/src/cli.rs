@@ -44,6 +44,8 @@ fn storage_engines() -> Vec<&'static str> {
         "dynostore",
         #[cfg(feature = "libsql")]
         "libsql",
+        #[cfg(feature = "nvme")]
+        "nvme",
         #[cfg(feature = "postgres")]
         "postgres",
         #[cfg(feature = "slatedb")]

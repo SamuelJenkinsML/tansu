@@ -11,9 +11,10 @@ repository.workspace = true
 version.workspace = true
 
 [features]
-default = ["dynostore", "libsql", "postgres", "slatedb", "turso"]
+default = ["dynostore", "libsql", "nvme", "postgres", "slatedb", "turso"]
 dynostore = ["dep:object_store"]
 libsql = ["dep:libsql"]
+nvme = ["tansu-storage/nvme"]
 postgres = ["dep:deadpool-postgres", "dep:tokio-postgres"]
 slatedb = ["dep:object_store", "dep:slatedb", "tansu-storage/slatedb"]
 turso = ["dep:turso"]

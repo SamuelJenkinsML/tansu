@@ -249,6 +249,9 @@ mod os;
 #[cfg(feature = "turso")]
 mod limbo;
 
+#[cfg(feature = "nvme")]
+pub mod nvme;
+
 /// Storage Errors
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
@@ -2461,6 +2464,38 @@ impl Builder<i32, String, Url, Url> {
                 message: self.storage.to_string(),
             }),
 
+            // Local-NVMe append-log engine: per-partition segment logs +
+            // in-memory coordination state + metadata WAL with group-commit
+            // fsync. Unlike file:// (dynostore over LocalFileSystem) this is
+            // a purpose-built local engine with no global coordination object.
+            #[cfg(feature = "nvme")]
+            "nvme" => {
+                if self.lake_house.is_some() {
+                    Err(Error::Message(
+                        "nvme:// does not support a lake house sink; use another engine for tansu.lake.sink".into(),
+                    ))
+                } else {
+                    let path = self.storage.path();
+                    std::fs::create_dir_all(path)?;
+
+                    nvme::Config::from_url(&self.storage)
+                        .map(|config| {
+                            nvme::Engine::new(self.cluster_id.as_str(), self.node_id, path)
+                                .advertised_listener(self.advertised_listener.clone())
+                                .schemas(self.schema_registry)
+                                .config(config)
+                        })
+                        .map(|storage| Box::new(storage) as Box<dyn Storage>)
+                        .map(Arc::new)
+                }
+            }
+
+            #[cfg(not(feature = "nvme"))]
+            "nvme" => Err(Error::FeatureNotEnabled {
+                feature: "nvme".into(),
+                message: self.storage.to_string(),
+            }),
+
             #[cfg(not(feature = "dynostore"))]
             "s3" | "memory" => Err(Error::FeatureNotEnabled {
                 feature: "dynostore".into(),
@@ -2569,6 +2604,7 @@ impl Builder<i32, String, Url, Url> {
             #[cfg(not(any(
                 feature = "dynostore",
                 feature = "libsql",
+                feature = "nvme",
                 feature = "postgres",
                 feature = "slatedb",
                 feature = "turso"
@@ -2584,6 +2620,7 @@ impl Builder<i32, String, Url, Url> {
             #[cfg(any(
                 feature = "dynostore",
                 feature = "libsql",
+                feature = "nvme",
                 feature = "postgres",
                 feature = "slatedb",
                 feature = "turso"

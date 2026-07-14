@@ -8675,6 +8675,7 @@ dependencies = [
  "cached",
  "chrono",
  "console",
+ "crc-fast",
  "criterion",
  "deadpool",
  "deadpool-postgres",
