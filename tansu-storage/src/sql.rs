@@ -358,6 +358,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/aborted_transactions_select.sql"),
         ),
         (
+            "txn_expired_select.sql",
+            include_sql!("sql/txn_expired_select.sql"),
+        ),
+        (
             "txn_produce_offset_select_overlapping_txn.sql",
             include_sql!("sql/txn_produce_offset_select_overlapping_txn.sql"),
         ),

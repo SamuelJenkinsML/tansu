@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, InitProducerIdRequest, InitProducerIdResponse};
+use tansu_sans_io::{ApiKey, ErrorCode, InitProducerIdRequest, InitProducerIdResponse};
 use tracing::instrument;
 
 use crate::{Error, Result, Storage};
@@ -102,6 +102,21 @@ where
         ctx: Context<G>,
         req: InitProducerIdRequest,
     ) -> Result<Self::Response, Self::Error> {
+        // Kafka rejects a transactional InitProducerId whose requested timeout
+        // exceeds the broker maximum (transaction.max.timeout.ms) or is
+        // non-positive (KIP-98; librdkafka 0103 do_test_misuse_txn).
+        const MAX_TRANSACTION_TIMEOUT_MS: i32 = 900_000;
+        if req.transactional_id.is_some()
+            && (req.transaction_timeout_ms <= 0
+                || req.transaction_timeout_ms > MAX_TRANSACTION_TIMEOUT_MS)
+        {
+            return Ok(InitProducerIdResponse::default()
+                .throttle_time_ms(0)
+                .error_code(ErrorCode::InvalidTransactionTimeout.into())
+                .producer_id(-1)
+                .producer_epoch(-1));
+        }
+
         ctx.state()
             .init_producer(
                 req.transactional_id.as_deref(),

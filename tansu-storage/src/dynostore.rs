@@ -2722,7 +2722,52 @@ impl Storage for DynoStore {
         Ok(())
     }
 
-    async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
+    async fn maintain_transactions(&self, now: SystemTime) -> Result<()> {
+        let expired: Vec<(String, i64, i16)> = self
+            .meta
+            .with(&self.object_store, move |meta| {
+                let mut expired = Vec::new();
+                for (transaction_id, txn) in &meta.transactions {
+                    for (epoch, detail) in &txn.epochs {
+                        if matches!(
+                            detail.state,
+                            Some(TxnState::Committed) | Some(TxnState::Aborted)
+                        ) {
+                            continue;
+                        }
+                        if let Some(started_at) = detail.started_at {
+                            let timeout =
+                                Duration::from_millis(detail.transaction_timeout_ms.max(0) as u64);
+                            if now
+                                .duration_since(started_at)
+                                .map(|elapsed| elapsed > timeout)
+                                .unwrap_or(false)
+                            {
+                                expired.push((transaction_id.clone(), txn.producer, *epoch));
+                            }
+                        }
+                    }
+                }
+                Ok(expired)
+            })
+            .await?;
+
+        // Abort each timed-out transaction through the normal end path.
+        for (transaction_id, producer_id, producer_epoch) in expired {
+            if let Err(err) = self
+                .txn_end(&transaction_id, producer_id, producer_epoch, false)
+                .await
+            {
+                tracing::error!(
+                    ?err,
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    "sweep abort failed"
+                );
+            }
+        }
+
         Ok(())
     }
 

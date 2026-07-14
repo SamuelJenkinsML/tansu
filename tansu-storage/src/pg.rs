@@ -3697,7 +3697,37 @@ impl Storage for Postgres {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
+        let expired: Vec<(String, i64, i16)> = {
+            let c = self.connection().await?;
+            self.prepare_query(&c, "txn_expired_select.sql", &[&self.cluster])
+                .await
+                .inspect_err(|err| error!(?err))?
+                .into_iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get::<_, String>(0)?,
+                        row.try_get::<_, i64>(1)?,
+                        row.try_get::<_, i16>(2)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        // Abort each timed-out transaction through the normal end path (writes
+        // abort control markers, advances the LSO, and retains the aborted
+        // ranges for read_committed).
+        for (transaction_id, producer_id, producer_epoch) in expired {
+            debug!(cluster = self.cluster, transaction_id, producer_id, producer_epoch, "sweep abort");
+            if let Err(err) = self
+                .txn_end(&transaction_id, producer_id, producer_epoch, false)
+                .await
+            {
+                error!(?err, transaction_id, producer_id, producer_epoch, "sweep abort failed");
+            }
+        }
+
         Ok(())
     }
 
