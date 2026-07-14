@@ -99,6 +99,8 @@ pub struct DynoStore {
     // Single-node local backend (file://): serialize OptiCon writes in-process
     // and overwrite unconditionally (LocalFileSystem has no conditional put).
     local: bool,
+    // Serializes the `put` helper's writes in local mode (no conditional put).
+    put_serialize: Arc<tokio::sync::Mutex<()>>,
 
     object_store: Arc<DynObjectStore>,
 }
@@ -384,6 +386,7 @@ impl DynoStore {
             watermarks: Arc::new(Mutex::new(BTreeMap::new())),
             meta: OptiCon::<Meta>::new(cluster),
             local: false,
+            put_serialize: Default::default(),
             object_store: Arc::new(Cache::new(
                 Metron::new(object_store, cluster),
                 Duration::from_millis(5_000),
@@ -473,6 +476,27 @@ impl DynoStore {
         V: PartialEq + Serialize + DeserializeOwned + Debug,
     {
         debug!(%location, ?attributes, ?update_version, ?value);
+
+        // Local backend: LocalFileSystem has neither conditional put nor custom
+        // attributes. Single-node → serialize in-process + overwrite; drop attrs.
+        if self.local {
+            let _serialize = self.put_serialize.lock().await;
+            let payload = serde_json::to_vec(&value)
+                .map(Bytes::from)
+                .map(PutPayload::from)?;
+            return self
+                .object_store
+                .put_opts(
+                    location,
+                    payload,
+                    PutOptions {
+                        mode: PutMode::Overwrite,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(Into::into);
+        }
 
         let options = PutOptions {
             mode: update_version.map_or(PutMode::Create, PutMode::Update),
@@ -1436,7 +1460,12 @@ impl Storage for DynoStore {
 
                 let options = PutOptions {
                     mode: PutMode::Overwrite,
-                    attributes: json_content_type(),
+                    // LocalFileSystem rejects custom put attributes.
+                    attributes: if self.local {
+                        Attributes::new()
+                    } else {
+                        json_content_type()
+                    },
                     ..Default::default()
                 };
 
