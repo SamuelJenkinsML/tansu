@@ -96,6 +96,9 @@ pub struct DynoStore {
     lake: Option<House>,
     watermarks: Arc<Mutex<BTreeMap<Topition, OptiCon<Watermark>>>>,
     meta: OptiCon<Meta>,
+    // Single-node local backend (file://): serialize OptiCon writes in-process
+    // and overwrite unconditionally (LocalFileSystem has no conditional put).
+    local: bool,
 
     object_store: Arc<DynObjectStore>,
 }
@@ -380,6 +383,7 @@ impl DynoStore {
 
             watermarks: Arc::new(Mutex::new(BTreeMap::new())),
             meta: OptiCon::<Meta>::new(cluster),
+            local: false,
             object_store: Arc::new(Cache::new(
                 Metron::new(object_store, cluster),
                 Duration::from_millis(5_000),
@@ -390,6 +394,16 @@ impl DynoStore {
     pub fn advertised_listener(self, advertised_listener: Url) -> Self {
         Self {
             advertised_listener,
+            ..self
+        }
+    }
+
+    /// Single-node local backend: serialize OptiCon writes in-process and
+    /// overwrite unconditionally (for object stores without conditional put).
+    pub fn local(self, local: bool) -> Self {
+        Self {
+            local,
+            meta: self.meta.local(local),
             ..self
         }
     }
@@ -613,7 +627,7 @@ impl Storage for DynoStore {
                     let watermark = self.watermarks.lock().map(|mut locked| {
                         locked
                             .entry(topition.to_owned())
-                            .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), &topition))
+                            .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), &topition).local(self.local))
                             .to_owned()
                     })?;
 
@@ -766,7 +780,7 @@ impl Storage for DynoStore {
             let watermark = self.watermarks.lock().map(|mut locked| {
                 locked
                     .entry(topition.to_owned())
-                    .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
+                    .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition).local(self.local))
                     .to_owned()
             })?;
 
@@ -899,7 +913,7 @@ impl Storage for DynoStore {
             let watermark = self.watermarks.lock().map(|mut locked| {
                 locked
                     .entry(topition.to_owned())
-                    .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
+                    .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition).local(self.local))
                     .to_owned()
             })?;
 
@@ -1181,7 +1195,7 @@ impl Storage for DynoStore {
         let watermark = self.watermarks.lock().map(|mut locked| {
             locked
                 .entry(topition.to_owned())
-                .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
+                .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), topition).local(self.local))
                 .to_owned()
         })?;
 

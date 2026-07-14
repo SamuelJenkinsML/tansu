@@ -2435,6 +2435,32 @@ impl Builder<i32, String, Url, Url> {
             .map(|storage| Box::new(storage) as Box<dyn Storage>)
             .map(Arc::new),
 
+            // Local-filesystem object store: the low-latency, local-durable
+            // "freshness tier" — same dynostore code path as s3://, backed by
+            // local NVMe instead of a remote object store.
+            #[cfg(feature = "dynostore")]
+            "file" => {
+                let path = self.storage.path();
+                std::fs::create_dir_all(path)?;
+                object_store::local::LocalFileSystem::new_with_prefix(path)
+                    .map(|object_store| {
+                        DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
+                            .local(true)
+                            .advertised_listener(self.advertised_listener.clone())
+                            .schemas(self.schema_registry)
+                            .lake(self.lake_house.clone())
+                    })
+                    .map(|storage| Box::new(storage) as Box<dyn Storage>)
+                    .map(Arc::new)
+                    .map_err(Into::into)
+            }
+
+            #[cfg(not(feature = "dynostore"))]
+            "file" => Err(Error::FeatureNotEnabled {
+                feature: "dynostore".into(),
+                message: self.storage.to_string(),
+            }),
+
             #[cfg(not(feature = "dynostore"))]
             "s3" | "memory" => Err(Error::FeatureNotEnabled {
                 feature: "dynostore".into(),
