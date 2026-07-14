@@ -1120,31 +1120,36 @@ impl Postgres {
             for txn in txns {
                 debug!(?txn);
 
-                _ = self
-                    .tx_prepare_execute(
-                        tx,
-                        "txn_produce_offset_delete_by_txn.sql",
-                        &[
-                            &self.cluster,
-                            &txn.name,
-                            &txn.producer_id,
-                            &txn.producer_epoch,
-                        ],
-                    )
-                    .await?;
+                // Retain txn_produce_offset / txn_topition on abort so
+                // read_committed fetches can report the aborted offset ranges via
+                // aborted_transactions; only committed txns clear them.
+                if txn.status == TxnState::PrepareCommit {
+                    _ = self
+                        .tx_prepare_execute(
+                            tx,
+                            "txn_produce_offset_delete_by_txn.sql",
+                            &[
+                                &self.cluster,
+                                &txn.name,
+                                &txn.producer_id,
+                                &txn.producer_epoch,
+                            ],
+                        )
+                        .await?;
 
-                _ = self
-                    .tx_prepare_execute(
-                        tx,
-                        "txn_topition_delete_by_txn.sql",
-                        &[
-                            &self.cluster,
-                            &txn.name,
-                            &txn.producer_id,
-                            &txn.producer_epoch,
-                        ],
-                    )
-                    .await?;
+                    _ = self
+                        .tx_prepare_execute(
+                            tx,
+                            "txn_topition_delete_by_txn.sql",
+                            &[
+                                &self.cluster,
+                                &txn.name,
+                                &txn.producer_id,
+                                &txn.producer_epoch,
+                            ],
+                        )
+                        .await?;
+                }
 
                 if txn.status == TxnState::PrepareCommit {
                     _ = self
@@ -2057,15 +2062,38 @@ impl Storage for Postgres {
         Ok(batches)
     }
 
-    // TODO (TS-B2 pg): populate the aborted-transaction index from txn abort
-    // markers so read_committed skips aborted records on the Postgres backend.
     #[instrument(skip_all)]
     async fn aborted_transactions(
         &self,
-        _topition: &Topition,
-        _fetch_offset: i64,
+        topition: &Topition,
+        fetch_offset: i64,
     ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
-        Ok(Vec::new())
+        debug!(cluster = self.cluster, ?topition, fetch_offset);
+        let c = self.connection().await?;
+        let topic = self.base_topic(topition.topic()).await?;
+        let partition = topition.partition();
+
+        let rows = self
+            .prepare_query(
+                &c,
+                "aborted_transactions_select.sql",
+                &[&self.cluster, &topic, &partition, &fetch_offset],
+            )
+            .await
+            .inspect_err(|err| error!(?topition, ?err))?;
+
+        let mut aborted = Vec::with_capacity(rows.len());
+        for row in rows {
+            let producer_id = row.try_get::<_, i64>(0)?;
+            let first_offset = row.try_get::<_, i64>(1)?;
+            aborted.push(
+                tansu_sans_io::fetch_response::AbortedTransaction::default()
+                    .producer_id(producer_id)
+                    .first_offset(first_offset),
+            );
+        }
+
+        Ok(aborted)
     }
 
     #[instrument(skip_all)]
