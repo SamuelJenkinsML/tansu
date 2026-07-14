@@ -846,6 +846,15 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
+    async fn aborted_transactions(
+        &self,
+        _topition: &Topition,
+        _fetch_offset: i64,
+    ) -> tansu_storage::Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
     async fn offset_commit(
         &self,
         _group: &str,

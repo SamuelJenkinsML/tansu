@@ -821,6 +821,14 @@ mod tests {
             unimplemented!()
         }
 
+        async fn aborted_transactions(
+            &self,
+            _topition: &Topition,
+            _fetch_offset: i64,
+        ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+            unimplemented!()
+        }
+
         async fn offset_commit(
             &self,
             _group: &str,
