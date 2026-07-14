@@ -53,7 +53,7 @@ jobs:
       - run: echo "PG_IMAGE_DASH=${POSTGRES_IMAGE/:/-}" >> $GITHUB_ENV
       - run: echo ${PG_IMAGE_DASH}
       - run: df -h
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: extractions/setup-just@v3
       - run: just ci
       - run: sudo apt-get install -y libclang-dev libkrb5-dev
@@ -86,7 +86,7 @@ jobs:
         os:
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: extractions/setup-just@v3
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -100,7 +100,7 @@ jobs:
         os:
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: extractions/setup-just@v3
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -114,7 +114,7 @@ jobs:
         os:
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: extractions/setup-just@v3
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -134,7 +134,7 @@ jobs:
           - postgres
           - slatedb
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy, rustfmt
@@ -158,7 +158,7 @@ jobs:
           - iceberg
           - parquet
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy, rustfmt
@@ -201,7 +201,7 @@ jobs:
       STORAGE_ENGINE: ${{matrix.storage.engine}}
       TANSU_IMAGE: hello-world
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: extractions/setup-just@v3
       - run: sudo apt-get install -y libclang-dev libkrb5-dev
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -276,7 +276,7 @@ jobs:
       STORAGE_ENGINE: ${{matrix.storage.engine}}
       TANSU_IMAGE: hello-world
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: extractions/setup-just@v3
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -324,21 +324,21 @@ jobs:
         os:
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: sudo apt-get install -y libclang-dev libkrb5-dev
       - run: cargo publish --dry-run --workspace
   typos:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: crate-ci/typos@v1.44.0
         with:
           config: typos.toml
   src:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: |
           git archive --format=tar.gz HEAD >${{runner.temp}}/src.tar.gz
       - uses: actions/upload-artifact@v7
@@ -357,7 +357,7 @@ jobs:
         os:
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: docker/metadata-action@v6
         id: meta
         with:
@@ -423,11 +423,11 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: tansu-io/example-java
           path: integration
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           sparse-checkout: |
             etc/initdb.d/010-schema.sql
@@ -492,7 +492,7 @@ jobs:
             flags: ""
             enabled: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
