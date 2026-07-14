@@ -1387,6 +1387,14 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Query the offset stage for a topic partition.
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage>;
 
+    /// Aborted transactions whose records overlap `fetch_offset` for a topic
+    /// partition, so `read_committed` consumers can skip aborted records.
+    async fn aborted_transactions(
+        &self,
+        topition: &Topition,
+        fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>>;
+
     /// Query the offsets for one or more topic partitions.
     async fn list_offsets(
         &self,
@@ -1593,6 +1601,16 @@ where
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         self.as_ref().offset_stage(topition).await
+    }
+
+    async fn aborted_transactions(
+        &self,
+        topition: &Topition,
+        fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        self.as_ref()
+            .aborted_transactions(topition, fetch_offset)
+            .await
     }
 
     async fn list_offsets(
@@ -1852,6 +1870,16 @@ where
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         self.as_ref().offset_stage(topition).await
+    }
+
+    async fn aborted_transactions(
+        &self,
+        topition: &Topition,
+        fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        self.as_ref()
+            .aborted_transactions(topition, fetch_offset)
+            .await
     }
 
     async fn list_offsets(
@@ -2896,6 +2924,41 @@ impl Storage for StorageContainer {
 
             #[cfg(feature = "turso")]
             Self::Turso(engine) => engine.offset_stage(topition),
+        }
+        .await
+        .inspect(|_| {
+            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
+        })
+        .inspect_err(|_| {
+            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
+        })
+    }
+
+    #[instrument(skip_all)]
+    async fn aborted_transactions(
+        &self,
+        topition: &Topition,
+        fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        let attributes = [KeyValue::new("method", "aborted_transactions")];
+
+        match self {
+            #[cfg(feature = "dynostore")]
+            Self::DynoStore(engine) => engine.aborted_transactions(topition, fetch_offset),
+
+            #[cfg(feature = "libsql")]
+            Self::Lite(engine) => engine.aborted_transactions(topition, fetch_offset),
+
+            Self::Null(engine) => engine.aborted_transactions(topition, fetch_offset),
+
+            #[cfg(feature = "postgres")]
+            Self::Postgres(engine) => engine.aborted_transactions(topition, fetch_offset),
+
+            #[cfg(feature = "slatedb")]
+            Self::Slate(engine) => engine.aborted_transactions(topition, fetch_offset),
+
+            #[cfg(feature = "turso")]
+            Self::Turso(engine) => engine.aborted_transactions(topition, fetch_offset),
         }
         .await
         .inspect(|_| {

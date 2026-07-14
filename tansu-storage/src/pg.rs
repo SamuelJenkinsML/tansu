@@ -2057,6 +2057,17 @@ impl Storage for Postgres {
         Ok(batches)
     }
 
+    // TODO (TS-B2 pg): populate the aborted-transaction index from txn abort
+    // markers so read_committed skips aborted records on the Postgres backend.
+    #[instrument(skip_all)]
+    async fn aborted_transactions(
+        &self,
+        _topition: &Topition,
+        _fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        Ok(Vec::new())
+    }
+
     #[instrument(skip_all)]
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         debug!(cluster = self.cluster, ?topition);

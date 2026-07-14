@@ -197,6 +197,17 @@ impl FetchService {
             .await
             .inspect_err(|error| error!(?error, ?tp))?;
 
+        // read_committed consumers need the aborted-transaction index to skip
+        // aborted records; read_uncommitted sees everything, so send none.
+        let aborted_transactions = if isolation == IsolationLevel::ReadCommitted {
+            ctx.state()
+                .aborted_transactions(&tp, fetch_partition.fetch_offset)
+                .await
+                .inspect_err(|error| error!(?error, ?tp))?
+        } else {
+            Vec::new()
+        };
+
         Ok(PartitionData::default()
             .partition_index(partition_index)
             .error_code(ErrorCode::None.into())
@@ -206,7 +217,7 @@ impl FetchService {
             .diverging_epoch(None)
             .current_leader(None)
             .snapshot_id(None)
-            .aborted_transactions(Some([].into()))
+            .aborted_transactions(Some(aborted_transactions))
             .preferred_read_replica(Some(-1))
             .records(if batches.is_empty() {
                 None

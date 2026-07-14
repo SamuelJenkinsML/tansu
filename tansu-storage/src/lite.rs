@@ -1707,6 +1707,16 @@ impl Storage for Engine {
         })
     }
 
+    async fn aborted_transactions(
+        &self,
+        topition: &Topition,
+        fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        self.inner
+            .aborted_transactions(topition, fetch_offset)
+            .await
+    }
+
     #[instrument(skip_all)]
     async fn offset_commit(
         &self,
@@ -2967,6 +2977,15 @@ impl Storage for Delegate {
                 )
             }
         })
+    }
+
+    #[instrument(skip(self))]
+    async fn aborted_transactions(
+        &self,
+        _topition: &Topition,
+        _fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        Ok(Vec::new())
     }
 
     #[instrument(skip(self))]

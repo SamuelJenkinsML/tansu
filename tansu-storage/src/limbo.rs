@@ -1713,6 +1713,14 @@ impl Storage for Engine {
         Ok(batches)
     }
 
+    async fn aborted_transactions(
+        &self,
+        _topition: &Topition,
+        _fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        Ok(Vec::new())
+    }
+
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         debug!(cluster = self.cluster, ?topition);
         let c = self.connection().await?;

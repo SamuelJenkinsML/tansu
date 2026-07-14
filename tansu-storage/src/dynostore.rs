@@ -1201,6 +1201,48 @@ impl Storage for DynoStore {
             .await
     }
 
+    async fn aborted_transactions(
+        &self,
+        topition: &Topition,
+        fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        self.meta
+            .with(&self.object_store, move |meta| {
+                let mut aborted = Vec::new();
+
+                for txn in meta.transactions.values() {
+                    for detail in txn.epochs.values() {
+                        if detail.state != Some(TxnState::Aborted) {
+                            continue;
+                        }
+
+                        // The offset range this aborted txn produced to this partition.
+                        let range = detail
+                            .produces
+                            .get(topition.topic())
+                            .and_then(|partitions| partitions.get(&topition.partition()))
+                            .and_then(|range| *range);
+
+                        if let Some(range) = range {
+                            // Only report txns whose records overlap the fetch range.
+                            if range.offset_end >= fetch_offset {
+                                aborted.push(
+                                    tansu_sans_io::fetch_response::AbortedTransaction::default()
+                                        .producer_id(txn.producer)
+                                        .first_offset(range.offset_start),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // read_committed clients expect ascending first_offset order.
+                aborted.sort_by_key(|aborted| aborted.first_offset);
+                Ok(aborted)
+            })
+            .await
+    }
+
     async fn list_offsets(
         &self,
         isolation_level: IsolationLevel,
@@ -2624,7 +2666,12 @@ impl Storage for DynoStore {
                                 }
                             }
 
-                            txn_detail.produces.clear();
+                            // Retain `produces` on abort so read_committed fetches
+                            // can report the aborted offset ranges via
+                            // `aborted_transactions`; only committed txns clear it.
+                            if txn_id.state == TxnState::PrepareCommit {
+                                txn_detail.produces.clear();
+                            }
                             txn_detail.offsets.clear();
                             _ = txn_detail.started_at.take();
                         }

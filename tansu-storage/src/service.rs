@@ -650,6 +650,17 @@ impl Storage for RequestChannelService {
         .map_err(Into::into)
     }
 
+    // Not wired through the actor Request enum; aborted-txn indexing is served
+    // by the concrete storage backends, not this proxy service layer.
+    #[instrument(skip_all)]
+    async fn aborted_transactions(
+        &self,
+        _topition: &Topition,
+        _fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        Ok(Vec::new())
+    }
+
     #[instrument(skip_all)]
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         self.serve(
