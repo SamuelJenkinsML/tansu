@@ -1120,27 +1120,16 @@ impl Postgres {
             for txn in txns {
                 debug!(?txn);
 
-                // Retain txn_produce_offset / txn_topition on abort so
-                // read_committed fetches can report the aborted offset ranges via
-                // aborted_transactions; only committed txns clear them.
-                if txn.status == TxnState::PrepareCommit {
+                // Move an aborting txn's produced ranges into the
+                // partition-level txn_aborted_range index before clearing:
+                // the index must outlive this txn detail (a same-epoch
+                // re-begin reuses it), so read_committed fetches keep
+                // reporting the aborted ranges via aborted_transactions.
+                if txn.status == TxnState::PrepareAbort {
                     _ = self
                         .tx_prepare_execute(
                             tx,
-                            "txn_produce_offset_delete_by_txn.sql",
-                            &[
-                                &self.cluster,
-                                &txn.name,
-                                &txn.producer_id,
-                                &txn.producer_epoch,
-                            ],
-                        )
-                        .await?;
-
-                    _ = self
-                        .tx_prepare_execute(
-                            tx,
-                            "txn_topition_delete_by_txn.sql",
+                            "txn_aborted_range_insert_from_produce.sql",
                             &[
                                 &self.cluster,
                                 &txn.name,
@@ -1150,6 +1139,32 @@ impl Postgres {
                         )
                         .await?;
                 }
+
+                _ = self
+                    .tx_prepare_execute(
+                        tx,
+                        "txn_produce_offset_delete_by_txn.sql",
+                        &[
+                            &self.cluster,
+                            &txn.name,
+                            &txn.producer_id,
+                            &txn.producer_epoch,
+                        ],
+                    )
+                    .await?;
+
+                _ = self
+                    .tx_prepare_execute(
+                        tx,
+                        "txn_topition_delete_by_txn.sql",
+                        &[
+                            &self.cluster,
+                            &txn.name,
+                            &txn.producer_id,
+                            &txn.producer_epoch,
+                        ],
+                    )
+                    .await?;
 
                 if txn.status == TxnState::PrepareCommit {
                     _ = self

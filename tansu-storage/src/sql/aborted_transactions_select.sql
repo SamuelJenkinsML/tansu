@@ -14,29 +14,27 @@
 -- limitations under the License.
 
 -- Aborted transactions whose produced records for this topic partition overlap
--- the fetch offset, so read_committed consumers can skip them.
+-- the fetch offset, so read_committed consumers can skip them. Served from
+-- the partition-level txn_aborted_range index, which outlives the producing
+-- txn_detail (a same-epoch re-begin reuses the detail row and resets its
+-- txn_produce_offset rows).
 -- prepare aborted_transactions_select (text, text, integer, bigint) as
 
 select
-    p.id as producer_id,
-    txn_po.offset_start as first_offset
+    tar.producer as producer_id,
+    tar.offset_start as first_offset
 
 from
     cluster c
     join topic t on t.cluster = c.id
     join topition tp on tp.topic = t.id
-    join txn on txn.cluster = c.id
-    join producer p on p.id = txn.producer
-    join txn_detail txn_d on txn_d."transaction" = txn.id
-    join txn_topition txn_tp on txn_tp.txn_detail = txn_d.id and txn_tp.topition = tp.id
-    join txn_produce_offset txn_po on txn_po.txn_topition = txn_tp.id
+    join txn_aborted_range tar on tar.topition = tp.id
 
 where
     c.name = $1
     and t.name = $2
     and tp.partition = $3
-    and txn_d.status = 'ABORTED'
-    and txn_po.offset_end >= $4
+    and tar.offset_end >= $4
 
 order by
-    txn_po.offset_start;
+    tar.offset_start;
