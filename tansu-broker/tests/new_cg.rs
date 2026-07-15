@@ -1573,3 +1573,129 @@ mod slatedb {
         Ok(())
     }
 }
+
+#[cfg(feature = "nvme")]
+mod nvme {
+    use std::sync::Arc;
+
+    use rand::rng;
+    use tansu_storage::Storage;
+    use uuid::Uuid;
+
+    use crate::common::StorageType;
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<Arc<Box<dyn Storage>>> {
+        common::storage_container(
+            StorageType::Nvme,
+            cluster.clone(),
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_consumer_session_delay_after_initial_join() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::one_consumer_session_delay_after_initial_join(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_consumer_next_action() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::one_consumer_next_action(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_consumer_next_action() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::two_consumer_next_action(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consumer_next_action_08c() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        group_consumer_next_action(storage, 0..8).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consumer_next_action_16c() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        group_consumer_next_action(storage, 0..16).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consumer_next_action_24c() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        group_consumer_next_action(storage, 0..24).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consumer_next_action_32c() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        group_consumer_next_action(storage, 0..32).await?;
+
+        Ok(())
+    }
+}

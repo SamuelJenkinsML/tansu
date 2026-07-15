@@ -284,3 +284,53 @@ mod in_memory {
         .await
     }
 }
+
+#[cfg(feature = "nvme")]
+mod nvme {
+    use std::sync::Arc;
+
+    use super::*;
+
+    async fn storage_container(cluster: Uuid, node: i32) -> Result<Arc<Box<dyn Storage>>> {
+        common::storage_container(
+            StorageType::Nvme,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn join_with_empty_member_id() -> Result<()> {
+        let _guard = common::init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::join_with_empty_member_id(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn rejoin_with_empty_member_id() -> Result<()> {
+        let _guard = common::init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::rejoin_with_empty_member_id(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+}
