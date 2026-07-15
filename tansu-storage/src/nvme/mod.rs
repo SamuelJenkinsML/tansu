@@ -114,6 +114,9 @@ pub struct Config {
     pub tier: Option<String>,
     /// Uploader cadence when a tier is configured.
     pub tier_interval: Duration,
+    /// Seal a non-empty active segment past this age so quiet partitions
+    /// still tier (the durability window on node death).
+    pub segment_age: Duration,
 }
 
 impl Default for Config {
@@ -127,6 +130,7 @@ impl Default for Config {
             disk_budget_bytes: 0,
             tier: None,
             tier_interval: Duration::from_secs(5),
+            segment_age: Duration::from_secs(300),
         }
     }
 }
@@ -176,6 +180,11 @@ impl Config {
                         .map(|duration| duration.0)
                         .map_err(|_| Error::Message(format!("nvme tier_interval: {v}")))?
                 }
+                "segment_age" => {
+                    config.segment_age = human_units::Duration::from_str(v.as_ref())
+                        .map(|duration| duration.0)
+                        .map_err(|_| Error::Message(format!("nvme segment_age: {v}")))?
+                }
 
                 _otherwise => (),
             }
@@ -222,7 +231,8 @@ pub struct Engine {
     /// Committed consumer offsets, keyed by (group, topic partition).
     group_offsets: RwLock<BTreeMap<(String, Topition), OffsetCommitRequest>>,
     /// The metadata WAL for this boot epoch; swapped at snapshot time.
-    wal: RwLock<Wal>,
+    /// Shared with the tier uploader (WAL mirroring).
+    wal: std::sync::Arc<RwLock<Wal>>,
     /// Approximate bytes in segments + WAL, for the disk-budget guard.
     disk_usage: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The object-store tier, when configured.
@@ -266,9 +276,11 @@ impl Engine {
 
         let partitions = std::sync::Arc::new(RwLock::new(recovered.partitions));
         let disk_usage = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let wal = std::sync::Arc::new(RwLock::new(recovered.wal));
 
-        // The uploader tiers sealed segments and evicts uploaded ones when
-        // the disk budget tightens.
+        // The uploader tiers sealed segments (evicting uploaded ones when
+        // the disk budget tightens) and mirrors the active WAL, so node
+        // death loses at most one tier interval of coordination state.
         let tier_task = tier.as_ref().map(|tier| {
             tokio::spawn(tier::tiering_loop(
                 partitions.clone(),
@@ -276,6 +288,8 @@ impl Engine {
                 disk_usage.clone(),
                 config.disk_budget_bytes,
                 config.tier_interval,
+                config.segment_age,
+                wal.clone(),
             ))
         });
 
@@ -290,7 +304,7 @@ impl Engine {
             partitions,
             groups: RwLock::new(recovered.groups),
             group_offsets: RwLock::new(recovered.group_offsets),
-            wal: RwLock::new(recovered.wal),
+            wal,
             disk_usage,
             tier,
             tier_task,
@@ -439,7 +453,7 @@ impl Engine {
         let written = snapshot::write(&snapshots_dir, &doc)?;
 
         // Mirror the snapshot to the tier: the coordination state a cold
-        // bootstrap starts from.
+        // bootstrap starts from. Mirrored WALs it captures then retire.
         if let Some(ref tier) = self.tier {
             let framed = std::fs::read(&written)
                 .map(Bytes::from)
@@ -449,6 +463,11 @@ impl Engine {
                 .upload_snapshot(retired_seq, framed)
                 .await
                 .inspect_err(|err| warn!(?err, "tier snapshot mirror"));
+
+            _ = tier
+                .delete_wals_below(retired_seq)
+                .await
+                .inspect_err(|err| warn!(?err, "tier wal retire"));
         }
 
         for seq in wal::wal_seqs(&wal_dir)? {

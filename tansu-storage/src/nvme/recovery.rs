@@ -103,8 +103,9 @@ pub(crate) async fn recover(
     manifest(root, cluster)?;
 
     // Cold bootstrap: with no local snapshot but a tiered mirror, pull the
-    // mirror down first — it carries the coordination state (topics, groups,
-    // producers, transactions) this data dir has never seen.
+    // snapshot AND the mirrored WAL files above it — together they carry the
+    // coordination state (topics, groups, producers, transactions) this
+    // data dir has never seen, to within one tier interval.
     if let Some(tier) = tier
         && snapshot::load_latest(&snapshots_dir)?.is_none()
         && let Some((seq, framed)) = tier.latest_snapshot().await?
@@ -113,6 +114,18 @@ pub(crate) async fn recover(
         let path = snapshots_dir.join(format!("{seq:020}.{}", snapshot::SNAPSHOT_SUFFIX));
         std::fs::write(&path, &framed)
             .map_err(|err| Error::Message(format!("nvme tier snapshot restore: {err}")))?;
+
+        for wal_seq in tier.wal_seqs().await? {
+            if wal_seq > seq {
+                info!(wal_seq, "cold bootstrap: downloading mirrored wal");
+                let bytes = tier.wal(wal_seq).await?;
+                std::fs::write(
+                    wal_dir.join(format!("{wal_seq:020}.{}", wal::WAL_SUFFIX)),
+                    &bytes,
+                )
+                .map_err(|err| Error::Message(format!("nvme tier wal restore: {err}")))?;
+            }
+        }
     }
 
     // Snapshot, then the WAL records it does not capture.

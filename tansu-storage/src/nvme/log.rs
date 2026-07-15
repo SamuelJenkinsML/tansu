@@ -55,6 +55,9 @@ pub(crate) struct SegmentWriter {
     pub base_offset: i64,
     /// Bytes appended so far (buffered writes included).
     pub position: u64,
+    /// For age-based sealing (the tier's durability window on quiet
+    /// partitions).
+    pub created_at: std::time::Instant,
     pub file: Arc<File>,
     pub flusher: Flusher,
 }
@@ -85,6 +88,7 @@ impl SegmentWriter {
         Ok(Self {
             base_offset,
             position: 0,
+            created_at: std::time::Instant::now(),
             file,
             flusher,
         })

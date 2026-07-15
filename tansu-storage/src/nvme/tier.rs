@@ -312,25 +312,63 @@ impl TierStore {
 
 type Partitions = Arc<RwLock<HashMap<Topition, Arc<PartitionState>>>>;
 
-/// The background uploader: tier sealed segments, publish the upload-lag
-/// gauge, and evict uploaded segments while the disk budget is tight.
+/// The background uploader: tier sealed segments, mirror the active WAL,
+/// publish the upload-lag gauge, and evict uploaded segments while the disk
+/// budget is tight.
 pub(crate) async fn tiering_loop(
     partitions: Partitions,
     tier: Arc<TierStore>,
     disk_usage: Arc<AtomicU64>,
     disk_budget: u64,
     interval: Duration,
+    segment_age: Duration,
+    wal: Arc<RwLock<super::wal::Wal>>,
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // (seq, bytes) of the last WAL mirror, to skip no-op uploads.
+    let mut mirrored: (u64, u64) = (0, 0);
+
     loop {
         _ = ticker.tick().await;
 
-        if let Err(err) = tick(&partitions, &tier, &disk_usage, disk_budget).await {
+        if let Err(err) = tick(&partitions, &tier, &disk_usage, disk_budget, segment_age).await {
             warn!(?err, "tiering tick");
         }
+
+        if let Err(err) = mirror_wal(&tier, &wal, &mut mirrored).await {
+            warn!(?err, "wal mirror");
+        }
     }
+}
+
+/// Mirror the active WAL when it changed. A capture racing an append is
+/// safe: replay truncates at the first torn frame.
+async fn mirror_wal(
+    tier: &TierStore,
+    wal: &Arc<RwLock<super::wal::Wal>>,
+    mirrored: &mut (u64, u64),
+) -> Result<()> {
+    let (seq, bytes, path) = {
+        let wal = wal.read()?;
+        (wal.seq, wal.bytes_since_open()?, wal.path().to_path_buf())
+    };
+
+    if *mirrored == (seq, bytes) || bytes == 0 {
+        return Ok(());
+    }
+
+    let contents = std::fs::read(&path)
+        .map(Bytes::from)
+        .map_err(|err| Error::Message(format!("nvme wal mirror read: {err}")))?;
+
+    tier.upload_wal(seq, contents).await?;
+    *mirrored = (seq, bytes);
+
+    debug!(seq, bytes, "wal mirrored");
+
+    Ok(())
 }
 
 async fn tick(
@@ -338,6 +376,7 @@ async fn tick(
     tier: &TierStore,
     disk_usage: &AtomicU64,
     disk_budget: u64,
+    segment_age: Duration,
 ) -> Result<()> {
     let list: Vec<(Topition, Arc<PartitionState>)> = partitions
         .read()?
@@ -350,7 +389,20 @@ async fn tick(
     for (topition, state) in &list {
         // Sealed, local, not-yet-uploaded segments and their sidecars.
         let jobs: Vec<(i64, std::path::PathBuf, Vec<SidecarEntry>)> = {
-            let inner = state.inner.lock()?;
+            let mut inner = state.inner.lock()?;
+
+            // Rotation is otherwise lazy (on the produce after the size
+            // threshold): seal an aged non-empty active segment here so a
+            // quiet partition's tail still tiers within its age window.
+            if inner.writer.as_ref().is_some_and(|writer| {
+                writer.position > 0 && writer.created_at.elapsed() >= segment_age
+            }) {
+                let old = inner.writer.take().expect("checked above");
+                _ = old.flusher.seal();
+                debug!(?topition, base = old.base_offset, "aged active segment sealed");
+                _ = inner.read_files.insert(old.base_offset, old.file);
+            }
+
             let active = inner.writer.as_ref().map(|writer| writer.base_offset);
 
             let mut jobs = vec![];
@@ -480,4 +532,69 @@ async fn tick(
     }
 
     Ok(())
+}
+
+impl TierStore {
+    fn wal_path(&self, seq: u64) -> Path {
+        Path::from(format!("{}/wal/{seq:020}.wal", self.prefix))
+    }
+
+    /// Mirror the (possibly still-active) WAL file. A capture racing an
+    /// append is fine: the CRC-framed torn-tail rule truncates any partial
+    /// record at replay.
+    pub(crate) async fn upload_wal(&self, seq: u64, bytes: Bytes) -> Result<()> {
+        _ = self
+            .store
+            .put(&self.wal_path(seq), bytes.into())
+            .await
+            .map_err(|err| Error::Message(format!("nvme tier put wal: {err}")))?;
+
+        Ok(())
+    }
+
+    /// Mirrored WAL sequences, ascending.
+    pub(crate) async fn wal_seqs(&self) -> Result<Vec<u64>> {
+        let prefix = Path::from(format!("{}/wal", self.prefix));
+        let mut stream = self.store.list(Some(&prefix));
+        let mut seqs = vec![];
+
+        while let Some(meta) = stream.next().await {
+            let meta = meta.map_err(|err| Error::Message(format!("nvme tier list: {err}")))?;
+
+            if let Some(name) = meta.location.parts().next_back()
+                && let Some(stem) = name.as_ref().strip_suffix(".wal")
+                && let Ok(seq) = stem.parse::<u64>()
+            {
+                seqs.push(seq);
+            }
+        }
+
+        seqs.sort_unstable();
+        Ok(seqs)
+    }
+
+    pub(crate) async fn wal(&self, seq: u64) -> Result<Bytes> {
+        self.store
+            .get(&self.wal_path(seq))
+            .await
+            .map_err(|err| Error::Message(format!("nvme tier get wal: {err}")))?
+            .bytes()
+            .await
+            .map_err(|err| Error::Message(format!("nvme tier read wal: {err}")))
+    }
+
+    /// A snapshot at `retired_seq` captures every WAL at or below it.
+    pub(crate) async fn delete_wals_below(&self, retired_seq: u64) -> Result<()> {
+        for seq in self.wal_seqs().await? {
+            if seq <= retired_seq {
+                _ = self
+                    .store
+                    .delete(&self.wal_path(seq))
+                    .await
+                    .inspect_err(|err| warn!(seq, ?err, "tier wal retire"));
+            }
+        }
+
+        Ok(())
+    }
 }

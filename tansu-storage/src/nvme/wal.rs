@@ -142,6 +142,7 @@ struct WalInner {
 #[derive(Debug)]
 pub(crate) struct Wal {
     pub seq: u64,
+    path: PathBuf,
     inner: std::sync::Mutex<WalInner>,
 }
 
@@ -163,12 +164,17 @@ impl Wal {
 
         Ok(Self {
             seq,
+            path,
             inner: std::sync::Mutex::new(WalInner {
                 file,
                 flusher,
                 bytes_since_open: 0,
             }),
         })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Bytes appended to this WAL file (the snapshot-cadence signal).
