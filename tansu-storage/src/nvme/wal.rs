@@ -182,7 +182,7 @@ impl Wal {
     }
 
     /// Append one record and return the durability ack to await, plus the
-    /// WAL's size so far (the caller's snapshot-cadence signal).
+    /// framed record's size on disk.
     pub(crate) fn append(&self, record: &WalRecord) -> Result<(oneshot::Receiver<Result<()>>, u64)> {
         let payload = serde_json::to_vec(record)?;
         let framed = frame::encode(FrameType::Wal, &payload);
@@ -195,7 +195,7 @@ impl Wal {
 
         inner.bytes_since_open += framed.len() as u64;
 
-        Ok((inner.flusher.sync()?, inner.bytes_since_open))
+        Ok((inner.flusher.sync()?, framed.len() as u64))
     }
 }
 

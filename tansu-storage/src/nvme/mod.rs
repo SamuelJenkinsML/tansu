@@ -81,10 +81,12 @@ mod partition;
 mod recovery;
 mod snapshot;
 mod state;
+mod tier;
 mod wal;
 
 use partition::{AbortedRange, BatchEntry, PartitionState};
 use state::{CoordState, ProducerDetail, Topic, Txn, TxnDetail};
+use tier::TierStore;
 use wal::{Wal, WalRecord};
 
 /// When produce/commit acks: after group-commit fdatasync (`Always`, the
@@ -97,13 +99,21 @@ pub enum FsyncMode {
 }
 
 /// Engine knobs, parsed from the `nvme://` URL query string.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub fsync: FsyncMode,
     pub fetch_max_block: Duration,
     pub segment_bytes: u64,
     pub snapshot_wal_bytes: u64,
     pub tail_cache_bytes: u64,
+    /// Refuse produces once segments+WAL exceed this (0 = unlimited).
+    pub disk_budget_bytes: u64,
+    /// Object-store tier for sealed segments and snapshot mirrors, e.g.
+    /// `s3://bucket` (credentials/endpoint from the environment). None =
+    /// local-only.
+    pub tier: Option<String>,
+    /// Uploader cadence when a tier is configured.
+    pub tier_interval: Duration,
 }
 
 impl Default for Config {
@@ -114,6 +124,9 @@ impl Default for Config {
             segment_bytes: 256 * 1024 * 1024,
             snapshot_wal_bytes: 64 * 1024 * 1024,
             tail_cache_bytes: 8 * 1024 * 1024,
+            disk_budget_bytes: 0,
+            tier: None,
+            tier_interval: Duration::from_secs(5),
         }
     }
 }
@@ -156,6 +169,13 @@ impl Config {
                 "segment_bytes" => config.segment_bytes = parse_size(&k, &v)?,
                 "snapshot_wal_bytes" => config.snapshot_wal_bytes = parse_size(&k, &v)?,
                 "tail_cache_bytes" => config.tail_cache_bytes = parse_size(&k, &v)?,
+                "disk_budget" => config.disk_budget_bytes = parse_size(&k, &v)?,
+                "tier" => config.tier = Some(v.to_string()),
+                "tier_interval" => {
+                    config.tier_interval = human_units::Duration::from_str(v.as_ref())
+                        .map(|duration| duration.0)
+                        .map_err(|_| Error::Message(format!("nvme tier_interval: {v}")))?
+                }
 
                 _otherwise => (),
             }
@@ -193,8 +213,9 @@ pub struct Engine {
     /// mutated in sub-microsecond critical sections. Never held across I/O.
     coord: tokio::sync::Mutex<CoordState>,
     /// Per-partition log state; the map itself is read-mostly (written only
-    /// by topic create/delete), each partition guards itself.
-    partitions: RwLock<HashMap<Topition, std::sync::Arc<PartitionState>>>,
+    /// by topic create/delete), each partition guards itself. Shared with
+    /// the tier uploader task.
+    partitions: std::sync::Arc<RwLock<HashMap<Topition, std::sync::Arc<PartitionState>>>>,
     /// Consumer-group state with optimistic-concurrency versions
     /// (the broker-side group coordinator drives this via update_group).
     groups: RwLock<HashMap<String, (GroupDetail, Version)>>,
@@ -202,8 +223,22 @@ pub struct Engine {
     group_offsets: RwLock<BTreeMap<(String, Topition), OffsetCommitRequest>>,
     /// The metadata WAL for this boot epoch; swapped at snapshot time.
     wal: RwLock<Wal>,
+    /// Approximate bytes in segments + WAL, for the disk-budget guard.
+    disk_usage: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The object-store tier, when configured.
+    tier: Option<std::sync::Arc<TierStore>>,
+    /// The background uploader; aborted when the engine drops.
+    tier_task: Option<tokio::task::JoinHandle<()>>,
     /// Exclusive data-dir lock, held for the engine's lifetime.
     _lock: std::fs::File,
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Some(task) = self.tier_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl Engine {
@@ -220,15 +255,29 @@ impl Engine {
         let cluster = cluster.into();
         let data_dir = data_dir.into();
 
-        let recovered = {
-            let cluster = cluster.clone();
-            let data_dir = data_dir.clone();
-            let fsync = config.fsync;
+        let tier = config
+            .tier
+            .as_deref()
+            .map(|tier| TierStore::open(tier, &cluster).map(std::sync::Arc::new))
+            .transpose()?;
 
-            tokio::task::spawn_blocking(move || recovery::recover(&data_dir, &cluster, fsync))
-                .await
-                .map_err(|err| Error::Message(format!("nvme recovery task: {err}")))??
-        };
+        let recovered =
+            recovery::recover(&data_dir, &cluster, config.fsync, tier.as_deref()).await?;
+
+        let partitions = std::sync::Arc::new(RwLock::new(recovered.partitions));
+        let disk_usage = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // The uploader tiers sealed segments and evicts uploaded ones when
+        // the disk budget tightens.
+        let tier_task = tier.as_ref().map(|tier| {
+            tokio::spawn(tier::tiering_loop(
+                partitions.clone(),
+                tier.clone(),
+                disk_usage.clone(),
+                config.disk_budget_bytes,
+                config.tier_interval,
+            ))
+        });
 
         let engine = Self {
             cluster,
@@ -238,12 +287,31 @@ impl Engine {
             schemas,
             config,
             coord: tokio::sync::Mutex::new(recovered.coord),
-            partitions: RwLock::new(recovered.partitions),
+            partitions,
             groups: RwLock::new(recovered.groups),
             group_offsets: RwLock::new(recovered.group_offsets),
             wal: RwLock::new(recovered.wal),
+            disk_usage,
+            tier,
+            tier_task,
             _lock: recovered.lock,
         };
+
+        // Seed the disk-budget accounting from the recovered indexes
+        // (tiered entries hold no local bytes).
+        let mut usage = 0u64;
+        for state in engine.partitions.read()?.values() {
+            let inner = state.inner.lock()?;
+            usage += inner
+                .batches
+                .values()
+                .filter(|entry| !entry.tiered)
+                .map(|entry| u64::from(entry.len))
+                .sum::<u64>();
+        }
+        engine
+            .disk_usage
+            .store(usage, std::sync::atomic::Ordering::Relaxed);
 
         engine.finish_boot(recovered.in_doubt).await?;
 
@@ -368,12 +436,29 @@ impl Engine {
         seal.await
             .map_err(|_| Error::Message("nvme wal seal dropped".into()))??;
 
-        _ = snapshot::write(&snapshots_dir, &doc)?;
+        let written = snapshot::write(&snapshots_dir, &doc)?;
+
+        // Mirror the snapshot to the tier: the coordination state a cold
+        // bootstrap starts from.
+        if let Some(ref tier) = self.tier {
+            let framed = std::fs::read(&written)
+                .map(Bytes::from)
+                .map_err(|err| Error::Message(format!("nvme snapshot reread: {err}")))?;
+
+            _ = tier
+                .upload_snapshot(retired_seq, framed)
+                .await
+                .inspect_err(|err| warn!(?err, "tier snapshot mirror"));
+        }
 
         for seq in wal::wal_seqs(&wal_dir)? {
             if seq <= retired_seq {
-                _ = std::fs::remove_file(wal_dir.join(format!("{seq:020}.{}", wal::WAL_SUFFIX)))
-                    .inspect_err(|err| warn!(seq, ?err, "wal retire"));
+                let path = wal_dir.join(format!("{seq:020}.{}", wal::WAL_SUFFIX));
+                let reclaimed = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                _ = std::fs::remove_file(&path).inspect_err(|err| warn!(seq, ?err, "wal retire"));
+                _ = self
+                    .disk_usage
+                    .fetch_sub(reclaimed, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -506,8 +591,12 @@ impl Engine {
             }
 
             for path in &files {
+                let reclaimed = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
                 _ = std::fs::remove_file(path)
                     .inspect_err(|err| warn!(?path, ?err, "retention delete"));
+                _ = self
+                    .disk_usage
+                    .fetch_sub(reclaimed, std::sync::atomic::Ordering::Relaxed);
             }
 
             debug!(?topition, new_start, deleted = files.len(), "retention");
@@ -518,6 +607,13 @@ impl Engine {
                 offset: new_start,
             })
             .await?;
+
+            if let Some(ref tier) = self.tier {
+                _ = tier
+                    .delete_segments_below(&topition, new_start)
+                    .await
+                    .inspect_err(|err| warn!(?err, ?topition, "tier retention"));
+            }
         }
 
         Ok(())
@@ -527,7 +623,10 @@ impl Engine {
     async fn wal_append(&self, record: WalRecord) -> Result<()> {
         let ack = {
             let wal = self.wal.read()?;
-            let (ack, _bytes) = wal.append(&record)?;
+            let (ack, bytes) = wal.append(&record)?;
+            _ = self
+                .disk_usage
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
             ack
         };
 
@@ -869,8 +968,20 @@ impl Storage for Engine {
         };
 
         for (_, state) in removed {
-            let dir = state.inner.lock()?.dir.clone();
+            let (dir, bytes) = {
+                let inner = state.inner.lock()?;
+                let bytes = inner
+                    .batches
+                    .values()
+                    .map(|entry| u64::from(entry.len))
+                    .sum::<u64>();
+                (inner.dir.clone(), bytes)
+            };
+
             _ = std::fs::remove_dir_all(&dir).inspect_err(|err| warn!(?dir, ?err));
+            _ = self
+                .disk_usage
+                .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
         }
 
         self.group_offsets
@@ -904,6 +1015,17 @@ impl Storage for Engine {
         deflated: deflated::Batch,
     ) -> Result<i64> {
         let attributes = BatchAttribute::try_from(deflated.attributes)?;
+
+        // Disk-budget guard: refuse rather than fill the volume — before the
+        // sequence bump, so a refused produce can be retried verbatim.
+        // Retention and topic deletion reclaim budget.
+        if self.config.disk_budget_bytes > 0
+            && self.disk_usage.load(std::sync::atomic::Ordering::Relaxed)
+                >= self.config.disk_budget_bytes
+        {
+            warn!(?topition, budget = self.config.disk_budget_bytes, "disk budget exhausted");
+            return Err(Error::Api(ErrorCode::KafkaStorageError));
+        }
 
         // Coordination checks: idempotent sequence validation (bumping the
         // stored sequence) and, for transactional data batches, an open-txn
@@ -957,6 +1079,7 @@ impl Storage for Engine {
 
         let producer_id = deflated.producer_id;
         let producer_epoch = deflated.producer_epoch;
+        let base_sequence = deflated.base_sequence;
         let last_offset_delta = deflated.last_offset_delta;
         let max_timestamp = deflated.max_timestamp;
 
@@ -995,17 +1118,25 @@ impl Storage for Engine {
             let position = writer.append(&framed)?;
             let ack = writer.flusher.sync()?;
 
+            _ = self
+                .disk_usage
+                .fetch_add(framed.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
             inner.index(
                 offset,
                 BatchEntry {
                     segment_base,
                     position,
                     len: framed.len() as u32,
+                    tiered: false,
                     cached: Some(batch_bytes),
                     last_offset_delta,
                     max_timestamp,
                     is_control: attributes.control,
+                    is_transactional: attributes.transaction,
                     producer_id,
+                    producer_epoch,
+                    base_sequence,
                 },
                 self.config.tail_cache_bytes,
             );
@@ -1072,6 +1203,7 @@ impl Storage for Engine {
         enum Pending {
             Cached(i64, Bytes),
             Disk(i64, std::sync::Arc<std::fs::File>, u64, u32),
+            Remote(i64, i64, u64, u32),
         }
 
         loop {
@@ -1128,9 +1260,15 @@ impl Storage for Engine {
                     let mut pending = Vec::with_capacity(wanted.len());
 
                     for (base, entry) in wanted {
-                        match entry.cached {
-                            Some(bytes) => pending.push(Pending::Cached(base, bytes)),
-                            None => {
+                        match (entry.cached, entry.tiered) {
+                            (Some(bytes), _) => pending.push(Pending::Cached(base, bytes)),
+                            (None, true) => pending.push(Pending::Remote(
+                                base,
+                                entry.segment_base,
+                                entry.position,
+                                entry.len,
+                            )),
+                            (None, false) => {
                                 let file = inner.read_handle(entry.segment_base)?;
                                 pending.push(Pending::Disk(
                                     base,
@@ -1156,6 +1294,16 @@ impl Storage for Engine {
                         Pending::Cached(base, bytes) => (base, bytes),
                         Pending::Disk(base, file, position, len) => {
                             (base, log::read_batch_at(&file, position, len)?)
+                        }
+                        Pending::Remote(base, segment_base, position, len) => {
+                            let tier = self.tier.as_ref().ok_or_else(|| {
+                                Error::Message("nvme: tiered batch without a tier".into())
+                            })?;
+
+                            (
+                                base,
+                                tier.read_batch(topition, segment_base, position, len).await?,
+                            )
                         }
                     };
 
@@ -2344,7 +2492,7 @@ impl Storage for Engine {
         let mut last_ack = None;
 
         for effect in &effects {
-            let (ack, _) = {
+            let (ack, bytes) = {
                 let wal = self.wal.read()?;
                 wal.append(&WalRecord::TxnTerminal {
                     transaction_id: effect.transaction.clone(),
@@ -2364,6 +2512,10 @@ impl Storage for Engine {
                     },
                 })?
             };
+
+            _ = self
+                .disk_usage
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
 
             last_ack = Some(ack);
         }
@@ -2869,6 +3021,256 @@ mod tests {
         let stage = engine.offset_stage(&topition).await?;
         assert_eq!((TASKS * EACH) as i64, stage.high_watermark());
         assert_eq!(stage.high_watermark(), stage.last_stable());
+
+        Ok(())
+    }
+
+    /// Requires MinIO with a `tansu-nvme-test` bucket and AWS_* env
+    /// pointing at it (the Thyme compose stack provides both):
+    ///
+    /// AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+    /// AWS_ENDPOINT=http://localhost:9000 AWS_ALLOW_HTTP=true \
+    /// AWS_DEFAULT_REGION=us-east-1 \
+    /// cargo test -p tansu-storage --lib nvme::tests::tiering -- --ignored
+    #[tokio::test]
+    #[ignore = "needs MinIO (AWS_* env + tansu-nvme-test bucket)"]
+    async fn tiering_cold_bootstrap_serves_from_object_store() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let topition = Topition::new("tiered", 0);
+        let unique = Uuid::now_v7();
+
+        let config = Config {
+            segment_bytes: 64, // every batch seals a segment
+            tier: Some(format!("s3://tansu-nvme-test/{unique}")),
+            tier_interval: Duration::from_millis(200),
+            ..Config::default()
+        };
+
+        {
+            let engine = Engine::open(
+                "test-cluster",
+                111,
+                dir.path(),
+                Url::parse("tcp://127.0.0.1:9092").expect("url"),
+                None,
+                config.clone(),
+            )
+            .await?;
+
+            _ = engine.create_topic(topic("tiered", 1), false).await?;
+
+            let pid = engine.init_producer(None, 0, Some(-1), Some(-1)).await?;
+            for sequence in 0..5 {
+                _ = engine
+                    .produce(
+                        None,
+                        &topition,
+                        batch(pid.id, pid.epoch, sequence, false, &format!("v{sequence}"))?,
+                    )
+                    .await?;
+            }
+
+            // Let the uploader tier the sealed segments, then mirror the
+            // snapshot (which finish_boot wrote before the topic existed).
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            engine.snapshot_now().await?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // Simulated node death: the local NVMe is gone entirely.
+        std::fs::remove_dir_all(dir.path()).expect("remove data dir");
+        std::fs::create_dir_all(dir.path()).expect("recreate data dir");
+
+        let engine = Engine::open(
+            "test-cluster",
+            111,
+            dir.path(),
+            Url::parse("tcp://127.0.0.1:9092").expect("url"),
+            None,
+            config,
+        )
+        .await?;
+
+        let stage = engine.offset_stage(&topition).await?;
+
+        // The active (unsealed) tail at death was never tiered: the durable
+        // contract on node loss is "everything up to the last sealed
+        // segment". With 64-byte segments only the newest batch can be
+        // un-sealed and un-uploaded.
+        assert!(
+            stage.high_watermark() >= 4,
+            "at least the sealed segments recover, got {}",
+            stage.high_watermark()
+        );
+
+        let batches = engine
+            .fetch(
+                &topition,
+                0,
+                1,
+                1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_millis(100),
+            )
+            .await?;
+
+        assert_eq!(stage.high_watermark() as usize, batches.len());
+        assert_eq!(0, batches[0].base_offset);
+
+        // And the log continues past the recovered watermark.
+        let pid = engine.init_producer(None, 0, Some(-1), Some(-1)).await?;
+        let offset = engine
+            .produce(None, &topition, batch(pid.id, pid.epoch, 0, false, "after")?)
+            .await?;
+        assert_eq!(stage.high_watermark(), offset);
+
+        Ok(())
+    }
+
+    /// See tiering_cold_bootstrap_serves_from_object_store for the env.
+    #[tokio::test]
+    #[ignore = "needs MinIO (AWS_* env + tansu-nvme-test bucket)"]
+    async fn tiering_evicts_under_disk_budget_and_reads_through() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let topition = Topition::new("evicted", 0);
+        let unique = Uuid::now_v7();
+
+        let engine = Engine::open(
+            "test-cluster",
+            111,
+            dir.path(),
+            Url::parse("tcp://127.0.0.1:9092").expect("url"),
+            None,
+            Config {
+                segment_bytes: 64,
+                tail_cache_bytes: 0,
+                disk_budget_bytes: 4096,
+                tier: Some(format!("s3://tansu-nvme-test/{unique}")),
+                tier_interval: Duration::from_millis(100),
+                ..Config::default()
+            },
+        )
+        .await?;
+
+        _ = engine.create_topic(topic("evicted", 1), false).await?;
+
+        let pid = engine.init_producer(None, 0, Some(-1), Some(-1)).await?;
+        for sequence in 0..30 {
+            _ = engine
+                .produce(
+                    None,
+                    &topition,
+                    batch(pid.id, pid.epoch, sequence, false, "spill me to s3")?,
+                )
+                .await?;
+
+            // Pace produces across uploader ticks so eviction keeps the
+            // usage under budget as it climbs.
+            if sequence % 3 == 2 {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+
+        // Uploader tiers the sealed segments then evicts under the budget.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let partition_dir = dir.path().join("topics").join("evicted-0000000000");
+        let (tiered, local_files) = {
+            let partitions = engine.partitions.read()?;
+            let state = partitions.get(&topition).expect("partition");
+            let inner = state.inner.lock()?;
+            (
+                inner.batches.values().filter(|entry| entry.tiered).count(),
+                log::segment_bases(&partition_dir)?.len(),
+            )
+        };
+
+        assert!(tiered > 0, "eviction must have tiered some batches");
+        assert!(local_files < 30, "some local segments must be gone");
+
+        // Every batch still readable: hot from disk, cold via ranged GET.
+        let batches = engine
+            .fetch(
+                &topition,
+                0,
+                1,
+                1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_millis(100),
+            )
+            .await?;
+        assert_eq!(30, batches.len());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disk_budget_refuses_then_reclaims() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let topition = Topition::new("budget", 0);
+
+        let engine = Engine::open(
+            "test-cluster",
+            111,
+            dir.path(),
+            Url::parse("tcp://127.0.0.1:9092").expect("url"),
+            None,
+            Config {
+                segment_bytes: 128,
+                disk_budget_bytes: 2048,
+                ..Config::default()
+            },
+        )
+        .await?;
+
+        _ = engine
+            .create_topic(
+                topic("budget", 1).configs(Some(
+                    [tansu_sans_io::create_topics_request::CreatableTopicConfig::default()
+                        .name("retention.ms".into())
+                        .value(Some("1000".into()))]
+                    .into(),
+                )),
+                false,
+            )
+            .await?;
+
+        let pid = engine.init_producer(None, 0, Some(-1), Some(-1)).await?;
+
+        let mut refused = None;
+        for sequence in 0..200 {
+            match engine
+                .produce(
+                    None,
+                    &topition,
+                    batch(pid.id, pid.epoch, sequence, false, "filling the disk")?,
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(Error::Api(ErrorCode::KafkaStorageError)) => {
+                    refused = Some(sequence);
+                    break;
+                }
+                Err(otherwise) => return Err(otherwise),
+            }
+        }
+
+        let refused = refused.expect("budget must refuse eventually");
+        assert!(refused > 4, "some produces must land first");
+
+        // Retention reclaims budget; produce works again.
+        engine
+            .maintain(SystemTime::now() + StdDuration::from_secs(3600))
+            .await?;
+
+        _ = engine
+            .produce(
+                None,
+                &topition,
+                batch(pid.id, pid.epoch, refused, false, "after reclaim")?,
+            )
+            .await?;
 
         Ok(())
     }

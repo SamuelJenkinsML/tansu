@@ -45,12 +45,17 @@ pub(crate) struct BatchEntry {
     pub segment_base: i64,
     pub position: u64,
     pub len: u32,
+    /// The segment is no longer local: serve by ranged GET from the tier.
+    pub tiered: bool,
     /// Raw batch bytes while within the tail-cache budget.
     pub cached: Option<Bytes>,
     pub last_offset_delta: i32,
     pub max_timestamp: i64,
     pub is_control: bool,
+    pub is_transactional: bool,
     pub producer_id: ProducerId,
+    pub producer_epoch: ProducerEpoch,
+    pub base_sequence: i32,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -80,6 +85,8 @@ pub(crate) struct PartitionInner {
     /// The active segment; created on first produce (a fresh segment per
     /// boot epoch — recovery never re-opens a tail for append).
     pub writer: Option<SegmentWriter>,
+    /// Sealed segments with a completed tier upload (evictable).
+    pub uploaded: std::collections::BTreeSet<Offset>,
     /// Read handles for positioned reads, one per segment, opened on demand.
     pub read_files: HashMap<i64, Arc<File>>,
     /// Tail-cache bookkeeping: offsets whose entries may still hold bytes.
@@ -98,6 +105,7 @@ impl PartitionInner {
             open_txns: BTreeMap::new(),
             aborted: Vec::new(),
             writer: None,
+            uploaded: std::collections::BTreeSet::new(),
             read_files: HashMap::new(),
             cache_queue: VecDeque::new(),
             cached_bytes: 0,

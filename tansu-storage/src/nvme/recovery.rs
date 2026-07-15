@@ -71,10 +71,11 @@ struct Skeleton {
     aborted: Vec<AbortedRange>,
 }
 
-pub(crate) fn recover(
+pub(crate) async fn recover(
     root: &Path,
     cluster: &str,
     fsync: super::FsyncMode,
+    tier: Option<&super::tier::TierStore>,
 ) -> Result<Recovered> {
     let topics_dir = root.join("topics");
     let wal_dir = root.join("wal");
@@ -100,6 +101,19 @@ pub(crate) fn recover(
     })?;
 
     manifest(root, cluster)?;
+
+    // Cold bootstrap: with no local snapshot but a tiered mirror, pull the
+    // mirror down first — it carries the coordination state (topics, groups,
+    // producers, transactions) this data dir has never seen.
+    if let Some(tier) = tier
+        && snapshot::load_latest(&snapshots_dir)?.is_none()
+        && let Some((seq, framed)) = tier.latest_snapshot().await?
+    {
+        info!(seq, "cold bootstrap: downloading tiered snapshot");
+        let path = snapshots_dir.join(format!("{seq:020}.{}", snapshot::SNAPSHOT_SUFFIX));
+        std::fs::write(&path, &framed)
+            .map_err(|err| Error::Message(format!("nvme tier snapshot restore: {err}")))?;
+    }
 
     // Snapshot, then the WAL records it does not capture.
     let snapshot = snapshot::load_latest(&snapshots_dir)?;
@@ -202,10 +216,13 @@ pub(crate) fn recover(
     }
 
     // Partitions known to the snapshot/WAL but with no segment directory
-    // yet (created topics that never produced).
+    // yet (created topics that never produced, or a cold bootstrap).
     for ((topic, partition), skeleton) in skeletons {
         let topition = Topition::new(topic, partition);
         let dir = topics_dir.join(std::path::PathBuf::from(&topition));
+
+        std::fs::create_dir_all(&dir)
+            .map_err(|err| Error::Message(format!("nvme create {dir:?}: {err}")))?;
 
         let state = PartitionState::new(dir);
         {
@@ -232,6 +249,103 @@ pub(crate) fn recover(
                     .map_err(|err| Error::Message(format!("nvme create {dir:?}: {err}")))?;
                 _ = vacant.insert(Arc::new(PartitionState::new(dir)));
             }
+        }
+    }
+
+    // Tiered segments absent locally: rebuild their indexes from the
+    // sidecars — no record data is downloaded; those batches serve by
+    // ranged GET until (if ever) rehydrated.
+    if let Some(tier) = tier {
+        for (topition, state) in &partitions {
+            let remote = tier.segment_bases(topition).await?;
+
+            if remote.is_empty() {
+                continue;
+            }
+
+            let local: std::collections::BTreeSet<i64> = {
+                let inner = state.inner.lock()?;
+                log::segment_bases(&inner.dir)?.into_iter().collect()
+            };
+
+            let mut sidecars = vec![];
+            for base in &remote {
+                if !local.contains(base) {
+                    sidecars.push((*base, tier.sidecar(topition, *base).await?));
+                }
+            }
+
+            let txn_by_producer: HashMap<i64, String> = coord
+                .transactions
+                .iter()
+                .map(|(id, txn)| (txn.producer, id.clone()))
+                .collect();
+
+            let mut inner = state.inner.lock()?;
+            inner.uploaded = remote.iter().copied().collect();
+
+            for (base, entries) in sidecars {
+                for entry in entries {
+                    let offset_end = entry.offset + i64::from(entry.last_offset_delta);
+
+                    inner.index(
+                        entry.offset,
+                        BatchEntry {
+                            segment_base: base,
+                            position: entry.position,
+                            len: entry.len,
+                            tiered: true,
+                            cached: None,
+                            last_offset_delta: entry.last_offset_delta,
+                            max_timestamp: entry.max_timestamp,
+                            is_control: entry.is_control,
+                            is_transactional: entry.is_transactional,
+                            producer_id: entry.producer_id,
+                            producer_epoch: entry.producer_epoch,
+                            base_sequence: entry.base_sequence,
+                        },
+                        0,
+                    );
+
+                    inner.next_offset = inner.next_offset.max(offset_end + 1);
+
+                    if entry.producer_id >= 0 && entry.base_sequence >= 0 {
+                        let sequences = coord
+                            .producers
+                            .entry(entry.producer_id)
+                            .or_default()
+                            .sequences
+                            .entry(entry.producer_epoch)
+                            .or_default()
+                            .entry(topition.topic().to_owned())
+                            .or_default()
+                            .entry(topition.partition())
+                            .or_default();
+
+                        *sequences =
+                            (*sequences).max(entry.base_sequence + entry.last_offset_delta + 1);
+                    }
+
+                    if entry.is_transactional
+                        && !entry.is_control
+                        && let Some(transaction_id) = txn_by_producer.get(&entry.producer_id)
+                        && let Some(txn) = coord.transactions.get_mut(transaction_id)
+                        && txn.producer == entry.producer_id
+                        && let Some(detail) = txn.epochs.get_mut(&entry.producer_epoch)
+                        && detail.state == Some(TxnState::Begin)
+                    {
+                        merge_range(detail, topition, entry.offset, offset_end);
+                    }
+                }
+            }
+
+            inner.durable_offset = inner.next_offset;
+
+            let log_start = inner.log_start;
+            inner.log_start = 0;
+            _ = inner.advance_log_start(log_start);
+
+            debug!(?topition, tiered = inner.uploaded.len(), next = inner.next_offset);
         }
     }
 
@@ -398,11 +512,15 @@ fn scan_partition(
                         segment_base: base,
                         position: scanned.file_position,
                         len: scanned.len,
+                        tiered: false,
                         cached: None,
                         last_offset_delta: batch.last_offset_delta,
                         max_timestamp: batch.max_timestamp,
                         is_control: attributes.control,
+                        is_transactional: attributes.transaction,
                         producer_id: batch.producer_id,
+                        producer_epoch: batch.producer_epoch,
+                        base_sequence: batch.base_sequence,
                     },
                     0,
                 );
