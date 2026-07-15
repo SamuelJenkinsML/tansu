@@ -184,6 +184,7 @@ impl CoordState {
     /// Merge a transactional produce into the txn's per-partition offset
     /// range. The txn must be in Begin: without this guard a concurrently
     /// swept (timed-out) txn would leak ranges into its next incarnation.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_txn_produce(
         &mut self,
         transaction_id: &str,

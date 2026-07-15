@@ -74,11 +74,18 @@ use crate::{
     TxnOffsetCommitRequest, TxnState, UpdateError, Version,
 };
 
+mod frame;
+mod groupcommit;
+mod log;
 mod partition;
+mod recovery;
+mod snapshot;
 mod state;
+mod wal;
 
 use partition::{AbortedRange, BatchEntry, PartitionState};
 use state::{CoordState, ProducerDetail, Topic, Txn, TxnDetail};
+use wal::{Wal, WalRecord};
 
 /// When produce/commit acks: after group-commit fdatasync (`Always`, the
 /// default and the only EOS-safe mode), or after the buffered write with a
@@ -178,7 +185,6 @@ pub struct Engine {
     cluster: String,
     node: i32,
     advertised_listener: Url,
-    // Segment/WAL root from M2; ping checks it exists meanwhile.
     data_dir: PathBuf,
     schemas: Option<Registry>,
     config: Config,
@@ -194,38 +200,339 @@ pub struct Engine {
     groups: RwLock<HashMap<String, (GroupDetail, Version)>>,
     /// Committed consumer offsets, keyed by (group, topic partition).
     group_offsets: RwLock<BTreeMap<(String, Topition), OffsetCommitRequest>>,
+    /// The metadata WAL for this boot epoch; swapped at snapshot time.
+    wal: RwLock<Wal>,
+    /// Exclusive data-dir lock, held for the engine's lifetime.
+    _lock: std::fs::File,
 }
 
 impl Engine {
-    pub fn new(cluster: impl Into<String>, node: i32, data_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            cluster: cluster.into(),
+    /// Recover (or initialize) the data dir and open the engine. The caller
+    /// must run [`Engine::finish_boot`] before serving traffic.
+    pub async fn open(
+        cluster: impl Into<String>,
+        node: i32,
+        data_dir: impl Into<PathBuf>,
+        advertised_listener: Url,
+        schemas: Option<Registry>,
+        config: Config,
+    ) -> Result<Self> {
+        let cluster = cluster.into();
+        let data_dir = data_dir.into();
+
+        let recovered = {
+            let cluster = cluster.clone();
+            let data_dir = data_dir.clone();
+            let fsync = config.fsync;
+
+            tokio::task::spawn_blocking(move || recovery::recover(&data_dir, &cluster, fsync))
+                .await
+                .map_err(|err| Error::Message(format!("nvme recovery task: {err}")))??
+        };
+
+        let engine = Self {
+            cluster,
             node,
-            advertised_listener: Url::parse("tcp://127.0.0.1:9092")
-                .expect("default advertised listener"),
-            data_dir: data_dir.into(),
-            schemas: None,
-            config: Config::default(),
-            coord: tokio::sync::Mutex::new(CoordState::default()),
-            partitions: RwLock::new(HashMap::new()),
-            groups: RwLock::new(HashMap::new()),
-            group_offsets: RwLock::new(BTreeMap::new()),
-        }
-    }
-
-    pub fn advertised_listener(self, advertised_listener: Url) -> Self {
-        Self {
             advertised_listener,
-            ..self
+            data_dir,
+            schemas,
+            config,
+            coord: tokio::sync::Mutex::new(recovered.coord),
+            partitions: RwLock::new(recovered.partitions),
+            groups: RwLock::new(recovered.groups),
+            group_offsets: RwLock::new(recovered.group_offsets),
+            wal: RwLock::new(recovered.wal),
+            _lock: recovered.lock,
+        };
+
+        engine.finish_boot(recovered.in_doubt).await?;
+
+        Ok(engine)
+    }
+
+    /// Complete recovery: finish resolving prepared transactions (writing
+    /// any missing end-txn markers), then snapshot so the replayed WAL
+    /// files retire.
+    async fn finish_boot(&self, in_doubt: Vec<(String, i64, i16, bool)>) -> Result<()> {
+        for (transaction_id, producer_id, producer_epoch, committed) in in_doubt {
+            let produced: Vec<(Topition, bool)> = {
+                let coord = self.coord.lock().await;
+
+                coord
+                    .produced(&transaction_id, producer_epoch)
+                    .into_iter()
+                    .map(|(topic, partition, range)| {
+                        let topition = Topition::new(topic, partition);
+                        let marker_present = self
+                            .partition_if_exists(&topition)
+                            .ok()
+                            .flatten()
+                            .and_then(|state| {
+                                state.inner.lock().ok().map(|inner| {
+                                    inner
+                                        .batches
+                                        .range(range.offset_start..)
+                                        .any(|(_, entry)| {
+                                            entry.is_control
+                                                && entry.producer_id == producer_id
+                                        })
+                                })
+                            })
+                            .unwrap_or(false);
+
+                        (topition, marker_present)
+                    })
+                    .collect()
+            };
+
+            for (topition, marker_present) in &produced {
+                if !marker_present {
+                    debug!(transaction_id, ?topition, committed, "boot: writing missing marker");
+                    _ = self
+                        .produce_marker(
+                            &transaction_id,
+                            producer_id,
+                            producer_epoch,
+                            committed,
+                            topition,
+                        )
+                        .await
+                        .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
+                }
+            }
+
+            // Resolution (or deferral behind a still-open peer) through the
+            // normal path; phase 1 is a no-op on a prepared txn.
+            _ = self
+                .txn_end(&transaction_id, producer_id, producer_epoch, committed)
+                .await
+                .inspect_err(|err| error!(?err, transaction_id))?;
         }
+
+        self.snapshot_now().await
     }
 
-    pub fn schemas(self, schemas: Option<Registry>) -> Self {
-        Self { schemas, ..self }
+    /// Rotate the WAL and persist a snapshot capturing everything up to the
+    /// rotated file, then retire old WAL files and snapshots.
+    async fn snapshot_now(&self) -> Result<()> {
+        let wal_dir = self.data_dir.join("wal");
+        let snapshots_dir = self.data_dir.join("snapshots");
+
+        // Hold coord across rotation + capture so no WAL record lands in
+        // both the retired files and the snapshot. (Group/offset writes take
+        // their own locks inside the capture; skew there is tolerated —
+        // replay of a duplicated record is idempotent.)
+        let coord = self.coord.lock().await;
+
+        let old = {
+            let mut wal = self.wal.write()?;
+            let next = Wal::create(&wal_dir, wal.seq + 1, self.config.fsync)?;
+            std::mem::replace(&mut *wal, next)
+        };
+
+        let retired_seq = old.seq;
+
+        let partitions: Vec<snapshot::SnapPartition> = {
+            let partitions = self.partitions.read()?;
+            let mut snaps = Vec::with_capacity(partitions.len());
+
+            for (topition, state) in partitions.iter() {
+                let inner = state.inner.lock()?;
+                snaps.push(snapshot::SnapPartition {
+                    topic: topition.topic().to_owned(),
+                    partition: topition.partition(),
+                    log_start: inner.log_start,
+                    aborted: inner.aborted.clone(),
+                });
+            }
+
+            snaps
+        };
+
+        let doc = {
+            let groups = self.groups.read()?;
+            let group_offsets = self.group_offsets.read()?;
+
+            snapshot::SnapshotDoc::from_state(
+                retired_seq,
+                &coord,
+                &groups,
+                &group_offsets,
+                partitions,
+            )
+        };
+
+        drop(coord);
+
+        let seal = old.seal()?;
+        seal.await
+            .map_err(|_| Error::Message("nvme wal seal dropped".into()))??;
+
+        _ = snapshot::write(&snapshots_dir, &doc)?;
+
+        for seq in wal::wal_seqs(&wal_dir)? {
+            if seq <= retired_seq {
+                _ = std::fs::remove_file(wal_dir.join(format!("{seq:020}.{}", wal::WAL_SUFFIX)))
+                    .inspect_err(|err| warn!(seq, ?err, "wal retire"));
+            }
+        }
+
+        snapshot::prune(&snapshots_dir)?;
+
+        debug!(retired_seq, "snapshot complete");
+
+        Ok(())
     }
 
-    pub fn config(self, config: Config) -> Self {
-        Self { config, ..self }
+    /// Kafka-style deletion retention: drop whole sealed segments whose
+    /// newest record is older than `retention.ms`, or oldest-first while the
+    /// partition exceeds `retention.bytes`; the log start advances to the
+    /// next segment boundary. The active segment is never deleted.
+    async fn apply_retention(&self, now: SystemTime) -> Result<()> {
+        const DEFAULT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+        let retention: HashMap<String, (i64, i64)> = {
+            let coord = self.coord.lock().await;
+
+            coord
+                .topics
+                .iter()
+                .map(|(name, metadata)| {
+                    let mut ms = DEFAULT_RETENTION_MS;
+                    let mut bytes = -1i64;
+
+                    for config in metadata.topic.configs.as_deref().unwrap_or_default() {
+                        match (config.name.as_str(), config.value.as_deref()) {
+                            ("retention.ms", Some(value)) => ms = value.parse().unwrap_or(ms),
+                            ("retention.bytes", Some(value)) => {
+                                bytes = value.parse().unwrap_or(bytes)
+                            }
+                            _otherwise => {}
+                        }
+                    }
+
+                    (name.clone(), (ms, bytes))
+                })
+                .collect()
+        };
+
+        let now_ms = now
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as i64)
+            .unwrap_or(0);
+
+        let partitions: Vec<(Topition, std::sync::Arc<PartitionState>)> = self
+            .partitions
+            .read()?
+            .iter()
+            .map(|(topition, state)| (topition.clone(), state.clone()))
+            .collect();
+
+        for (topition, state) in partitions {
+            let Some((ms, bytes)) = retention.get(topition.topic()).copied() else {
+                continue;
+            };
+
+            if ms < 0 && bytes < 0 {
+                continue;
+            }
+
+            let (new_start, files): (i64, Vec<PathBuf>) = {
+                let mut inner = state.inner.lock()?;
+
+                let active = inner.writer.as_ref().map(|writer| writer.base_offset);
+
+                // Sealed-segment stats from the index: newest timestamp and
+                // on-disk bytes per segment.
+                let mut segments: BTreeMap<i64, (i64, u64)> = BTreeMap::new();
+
+                for entry in inner.batches.values() {
+                    if Some(entry.segment_base) == active {
+                        continue;
+                    }
+
+                    let segment = segments.entry(entry.segment_base).or_insert((i64::MIN, 0));
+                    segment.0 = segment.0.max(entry.max_timestamp);
+                    segment.1 += u64::from(entry.len);
+                }
+
+                let mut total: u64 = segments.values().map(|(_, bytes)| bytes).sum::<u64>()
+                    + inner.writer.as_ref().map_or(0, |writer| writer.position);
+
+                let bases: Vec<i64> = segments.keys().copied().collect();
+                let mut new_start = inner.log_start;
+
+                for (index, base) in bases.iter().enumerate() {
+                    let (max_ts, seg_bytes) = segments[base];
+
+                    // Deleting a segment moves the log start to where the
+                    // next one (or the active tail) begins.
+                    let boundary = bases
+                        .get(index + 1)
+                        .copied()
+                        .or(active)
+                        .unwrap_or(inner.next_offset);
+
+                    let expired = ms >= 0 && max_ts >= 0 && max_ts < now_ms - ms;
+                    let oversize = bytes >= 0 && total > bytes as u64;
+
+                    if expired || oversize {
+                        new_start = new_start.max(boundary);
+                        total = total.saturating_sub(seg_bytes);
+                    } else {
+                        break;
+                    }
+                }
+
+                if new_start <= inner.log_start {
+                    continue;
+                }
+
+                _ = inner.advance_log_start(new_start);
+
+                let mut files = vec![];
+                for base in log::segment_bases(&inner.dir)? {
+                    if base < new_start && Some(base) != active {
+                        _ = inner.read_files.remove(&base);
+                        files.push(log::segment_path(&inner.dir, base));
+                    }
+                }
+
+                (inner.log_start, files)
+            };
+
+            if files.is_empty() {
+                continue;
+            }
+
+            for path in &files {
+                _ = std::fs::remove_file(path)
+                    .inspect_err(|err| warn!(?path, ?err, "retention delete"));
+            }
+
+            debug!(?topition, new_start, deleted = files.len(), "retention");
+
+            self.wal_append(WalRecord::LogStartAdvance {
+                topic: topition.topic().to_owned(),
+                partition: topition.partition(),
+                offset: new_start,
+            })
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Append one WAL record and wait until it is durable.
+    async fn wal_append(&self, record: WalRecord) -> Result<()> {
+        let ack = {
+            let wal = self.wal.read()?;
+            let (ack, _bytes) = wal.append(&record)?;
+            ack
+        };
+
+        ack.await
+            .map_err(|_| Error::Message("nvme wal flusher dropped".into()))?
     }
 
     /// The partition's shared state, created on demand: like dynostore,
@@ -235,10 +542,18 @@ impl Engine {
             return Ok(partition.clone());
         }
 
+        let dir = self
+            .data_dir
+            .join("topics")
+            .join(PathBuf::from(topition));
+
+        std::fs::create_dir_all(&dir)
+            .map_err(|err| Error::Message(format!("nvme create {dir:?}: {err}")))?;
+
         let mut partitions = self.partitions.write()?;
         Ok(partitions
             .entry(topition.clone())
-            .or_insert_with(|| std::sync::Arc::new(PartitionState::default()))
+            .or_insert_with(|| std::sync::Arc::new(PartitionState::new(dir)))
             .clone())
     }
 
@@ -403,14 +718,15 @@ impl Storage for Engine {
             id
         };
 
-        {
-            let mut partitions = self.partitions.write()?;
-            for partition in 0..topic.num_partitions {
-                _ = partitions
-                    .entry(Topition::new(topic.name.as_str(), partition))
-                    .or_insert_with(|| std::sync::Arc::new(PartitionState::default()));
-            }
+        for partition in 0..topic.num_partitions {
+            _ = self.partition(&Topition::new(topic.name.as_str(), partition))?;
         }
+
+        self.wal_append(WalRecord::TopicCreate {
+            id,
+            topic: topic.clone(),
+        })
+        .await?;
 
         Ok(id)
     }
@@ -426,10 +742,18 @@ impl Storage for Engine {
             .resource_name(resource.resource_name.clone());
 
         if let ConfigResource::Topic = ConfigResource::from(resource.resource_type) {
-            self.coord.lock().await.alter_topic(
-                resource.resource_name.as_str(),
-                resource.configs.as_deref().unwrap_or_default(),
-            )?;
+            let changes = resource.configs.clone().unwrap_or_default();
+
+            self.coord
+                .lock()
+                .await
+                .alter_topic(resource.resource_name.as_str(), &changes)?;
+
+            self.wal_append(WalRecord::ConfigAlter {
+                name: resource.resource_name.clone(),
+                changes,
+            })
+            .await?;
         }
 
         Ok(response)
@@ -458,27 +782,42 @@ impl Storage for Engine {
                         .low_watermark(-1)
                         .error_code(ErrorCode::UnknownTopicOrPartition.into())
                 } else if let Some(state) = self.partition_if_exists(&topition)? {
-                    let mut inner = state.inner.lock()?;
+                    let advanced = {
+                        let mut inner = state.inner.lock()?;
 
-                    // -1 means truncate to the high watermark.
-                    let target = if partition.offset < 0 {
-                        inner.high_watermark()
-                    } else {
-                        partition.offset
+                        // -1 means truncate to the high watermark.
+                        let target = if partition.offset < 0 {
+                            inner.high_watermark()
+                        } else {
+                            partition.offset
+                        };
+
+                        if target > inner.high_watermark() {
+                            None
+                        } else {
+                            Some(inner.advance_log_start(target))
+                        }
                     };
 
-                    if target > inner.high_watermark() {
-                        DeleteRecordsPartitionResult::default()
+                    match advanced {
+                        None => DeleteRecordsPartitionResult::default()
                             .partition_index(partition.partition_index)
                             .low_watermark(-1)
-                            .error_code(ErrorCode::OffsetOutOfRange.into())
-                    } else {
-                        let low_watermark = inner.advance_log_start(target);
+                            .error_code(ErrorCode::OffsetOutOfRange.into()),
 
-                        DeleteRecordsPartitionResult::default()
-                            .partition_index(partition.partition_index)
-                            .low_watermark(low_watermark)
-                            .error_code(ErrorCode::None.into())
+                        Some(low_watermark) => {
+                            self.wal_append(WalRecord::LogStartAdvance {
+                                topic: topic.name.clone(),
+                                partition: partition.partition_index,
+                                offset: low_watermark,
+                            })
+                            .await?;
+
+                            DeleteRecordsPartitionResult::default()
+                                .partition_index(partition.partition_index)
+                                .low_watermark(low_watermark)
+                                .error_code(ErrorCode::None.into())
+                        }
                     }
                 } else {
                     DeleteRecordsPartitionResult::default()
@@ -516,13 +855,29 @@ impl Storage for Engine {
             name
         };
 
-        self.partitions
-            .write()?
-            .retain(|topition, _| topition.topic() != name);
+        // Remove the log directories too: recovery must not resurrect a
+        // deleted topic's data from its segments.
+        let removed: Vec<_> = {
+            let mut partitions = self.partitions.write()?;
+            let removed = partitions
+                .iter()
+                .filter(|(topition, _)| topition.topic() == name)
+                .map(|(topition, state)| (topition.clone(), state.clone()))
+                .collect();
+            partitions.retain(|topition, _| topition.topic() != name);
+            removed
+        };
+
+        for (_, state) in removed {
+            let dir = state.inner.lock()?.dir.clone();
+            _ = std::fs::remove_dir_all(&dir).inspect_err(|err| warn!(?dir, ?err));
+        }
 
         self.group_offsets
             .write()?
             .retain(|(_, topition), _| topition.topic() != name);
+
+        self.wal_append(WalRecord::TopicDelete { name }).await?;
 
         Ok(ErrorCode::None)
     }
@@ -605,21 +960,54 @@ impl Storage for Engine {
         let last_offset_delta = deflated.last_offset_delta;
         let max_timestamp = deflated.max_timestamp;
 
-        let (offset, offset_end) = {
+        let batch_bytes = Bytes::from(deflated);
+
+        let (offset, offset_end, ack) = {
             let mut inner = partition.inner.lock()?;
 
             let offset = inner.next_offset;
             let offset_end = offset + i64::from(last_offset_delta);
             inner.next_offset = offset_end + 1;
 
-            _ = inner.batches.insert(
+            let framed = log::encode_batch(offset, &batch_bytes);
+
+            // Create the active segment on first produce (one per boot
+            // epoch) and rotate it at the size threshold; the sealed file
+            // moves to the read handles.
+            if inner
+                .writer
+                .as_ref()
+                .is_none_or(|writer| writer.position >= self.config.segment_bytes)
+            {
+                if let Some(old) = inner.writer.take() {
+                    _ = old.flusher.seal();
+                    _ = inner.read_files.insert(old.base_offset, old.file);
+                }
+
+                let name = format!("{}-{}", topition.topic(), topition.partition());
+                let writer =
+                    log::SegmentWriter::create(&inner.dir, &name, offset, self.config.fsync)?;
+                inner.writer = Some(writer);
+            }
+
+            let writer = inner.writer.as_mut().expect("active segment");
+            let segment_base = writer.base_offset;
+            let position = writer.append(&framed)?;
+            let ack = writer.flusher.sync()?;
+
+            inner.index(
                 offset,
                 BatchEntry {
+                    segment_base,
+                    position,
+                    len: framed.len() as u32,
+                    cached: Some(batch_bytes),
                     last_offset_delta,
                     max_timestamp,
                     is_control: attributes.control,
-                    encoded: Bytes::from(deflated),
+                    producer_id,
                 },
+                self.config.tail_cache_bytes,
             );
 
             if let Some(transaction_id) = transaction_id
@@ -632,8 +1020,18 @@ impl Storage for Engine {
                     .or_insert(offset);
             }
 
-            (offset, offset_end)
+            (offset, offset_end, ack)
         };
+
+        // Ack only after the group-commit fsync: the high watermark must
+        // never expose data a crash would lose.
+        ack.await
+            .map_err(|_| Error::Message("nvme segment flusher dropped".into()))??;
+
+        {
+            let mut inner = partition.inner.lock()?;
+            inner.durable_offset = inner.durable_offset.max(offset_end + 1);
+        }
 
         if let Some(transaction_id) = transaction_id
             && attributes.transaction
@@ -671,12 +1069,17 @@ impl Storage for Engine {
         let deadline = tokio::time::Instant::now()
             + max_wait.min(self.config.fetch_max_block);
 
+        enum Pending {
+            Cached(i64, Bytes),
+            Disk(i64, std::sync::Arc<std::fs::File>, u64, u32),
+        }
+
         loop {
             let notified = partition.notify.notified();
             tokio::pin!(notified);
 
-            let encoded: Vec<(i64, Bytes)> = {
-                let inner = partition.inner.lock()?;
+            let pending: Vec<Pending> = {
+                let mut inner = partition.inner.lock()?;
 
                 let limit = match isolation {
                     IsolationLevel::ReadCommitted => inner.last_stable(),
@@ -684,7 +1087,7 @@ impl Storage for Engine {
                 };
 
                 if offset < limit {
-                    let mut wanted: Vec<(i64, Bytes)> = vec![];
+                    let mut wanted: Vec<(i64, BatchEntry)> = vec![];
 
                     // The fetch offset can fall inside a batch that starts
                     // before it; Kafka returns that batch whole, leaving the
@@ -694,31 +1097,68 @@ impl Storage for Engine {
                         && *base + i64::from(entry.last_offset_delta) >= offset
                         && *base >= inner.log_start
                     {
-                        wanted.push((*base, entry.encoded.clone()));
+                        wanted.push((*base, entry.clone()));
                     }
 
                     let mut budget = u64::from(max_bytes);
+                    let mut stop = false;
 
-                    for (base, entry) in inner.batches.range(offset..limit) {
-                        wanted.push((*base, entry.encoded.clone()));
+                    let in_range: Vec<(i64, BatchEntry)> = inner
+                        .batches
+                        .range(offset..limit)
+                        .map(|(base, entry)| (*base, entry.clone()))
+                        .collect();
 
-                        let size = entry.encoded.len() as u64;
-                        if size > budget {
+                    for (base, entry) in in_range {
+                        if stop {
                             break;
+                        }
+
+                        let size = u64::from(entry.len);
+                        wanted.push((base, entry));
+
+                        // At least one batch is always returned; stop once
+                        // the size budget is exceeded (dynostore semantics).
+                        if size > budget {
+                            stop = true;
                         }
                         budget = budget.saturating_sub(size);
                     }
 
-                    wanted
+                    let mut pending = Vec::with_capacity(wanted.len());
+
+                    for (base, entry) in wanted {
+                        match entry.cached {
+                            Some(bytes) => pending.push(Pending::Cached(base, bytes)),
+                            None => {
+                                let file = inner.read_handle(entry.segment_base)?;
+                                pending.push(Pending::Disk(
+                                    base,
+                                    file,
+                                    entry.position,
+                                    entry.len,
+                                ));
+                            }
+                        }
+                    }
+
+                    pending
                 } else {
                     vec![]
                 }
             };
 
-            if !encoded.is_empty() {
-                let mut batches = Vec::with_capacity(encoded.len());
+            if !pending.is_empty() {
+                let mut batches = Vec::with_capacity(pending.len());
 
-                for (base_offset, bytes) in encoded {
+                for item in pending {
+                    let (base_offset, bytes) = match item {
+                        Pending::Cached(base, bytes) => (base, bytes),
+                        Pending::Disk(base, file, position, len) => {
+                            (base, log::read_batch_at(&file, position, len)?)
+                        }
+                    };
+
                     let mut batch = deflated::Batch::try_from(bytes)?;
                     batch.base_offset = base_offset;
                     batches.push(batch);
@@ -871,18 +1311,35 @@ impl Storage for Engine {
         };
 
         let mut responses = vec![];
-        let mut group_offsets = self.group_offsets.write()?;
+        let mut accepted = vec![];
 
-        for (topition, offset_commit) in offsets {
-            if known.contains(topition.topic()) {
-                _ = group_offsets.insert(
-                    (group_id.to_owned(), topition.to_owned()),
-                    offset_commit.to_owned(),
-                );
-                responses.push((topition.to_owned(), ErrorCode::None));
-            } else {
-                responses.push((topition.to_owned(), ErrorCode::UnknownTopicOrPartition));
+        {
+            let mut group_offsets = self.group_offsets.write()?;
+
+            for (topition, offset_commit) in offsets {
+                if known.contains(topition.topic()) {
+                    _ = group_offsets.insert(
+                        (group_id.to_owned(), topition.to_owned()),
+                        offset_commit.to_owned(),
+                    );
+                    accepted.push((
+                        topition.topic().to_owned(),
+                        topition.partition(),
+                        offset_commit.to_owned(),
+                    ));
+                    responses.push((topition.to_owned(), ErrorCode::None));
+                } else {
+                    responses.push((topition.to_owned(), ErrorCode::UnknownTopicOrPartition));
+                }
             }
+        }
+
+        if !accepted.is_empty() {
+            self.wal_append(WalRecord::GroupOffsetCommit {
+                group: group_id.to_owned(),
+                offsets: accepted,
+            })
+            .await?;
         }
 
         Ok(responses)
@@ -980,11 +1437,23 @@ impl Storage for Engine {
         mechanism: ScramMechanism,
         credential: ScramCredential,
     ) -> Result<()> {
-        let mut coord = self.coord.lock().await;
-        _ = coord
-            .scram
-            .insert((user.to_owned(), format!("{mechanism:?}")), credential);
-        Ok(())
+        let record = WalRecord::ScramUpsert {
+            user: user.to_owned(),
+            mechanism: format!("{mechanism:?}"),
+            salt: credential.salt.to_vec(),
+            iterations: credential.iterations,
+            stored_key: credential.stored_key.to_vec(),
+            server_key: credential.server_key.to_vec(),
+        };
+
+        {
+            let mut coord = self.coord.lock().await;
+            _ = coord
+                .scram
+                .insert((user.to_owned(), format!("{mechanism:?}")), credential);
+        }
+
+        self.wal_append(record).await
     }
 
     async fn delete_user_scram_credential(
@@ -992,9 +1461,16 @@ impl Storage for Engine {
         user: &str,
         mechanism: ScramMechanism,
     ) -> Result<()> {
-        let mut coord = self.coord.lock().await;
-        _ = coord.scram.remove(&(user.to_owned(), format!("{mechanism:?}")));
-        Ok(())
+        {
+            let mut coord = self.coord.lock().await;
+            _ = coord.scram.remove(&(user.to_owned(), format!("{mechanism:?}")));
+        }
+
+        self.wal_append(WalRecord::ScramDelete {
+            user: user.to_owned(),
+            mechanism: format!("{mechanism:?}"),
+        })
+        .await
     }
 
     async fn user_scram_credential(
@@ -1087,28 +1563,40 @@ impl Storage for Engine {
         let mut results = vec![];
 
         if let Some(group_ids) = group_ids {
-            let mut groups = self.groups.write()?;
-            let mut group_offsets = self.group_offsets.write()?;
+            let mut deleted = vec![];
 
-            for group_id in group_ids {
-                let had_group_state = groups.remove(group_id).is_some();
+            {
+                let mut groups = self.groups.write()?;
+                let mut group_offsets = self.group_offsets.write()?;
 
-                let before = group_offsets.len();
-                group_offsets.retain(|(group, _), _| group != group_id);
-                let deleted_committed_offsets = before != group_offsets.len();
+                for group_id in group_ids {
+                    let had_group_state = groups.remove(group_id).is_some();
 
-                results.push(
-                    DeletableGroupResult::default()
-                        .group_id(group_id.into())
-                        .error_code(
-                            if had_group_state || deleted_committed_offsets {
-                                ErrorCode::None
-                            } else {
-                                ErrorCode::GroupIdNotFound
-                            }
-                            .into(),
-                        ),
-                );
+                    let before = group_offsets.len();
+                    group_offsets.retain(|(group, _), _| group != group_id);
+                    let deleted_committed_offsets = before != group_offsets.len();
+
+                    if had_group_state || deleted_committed_offsets {
+                        deleted.push(group_id.clone());
+                    }
+
+                    results.push(
+                        DeletableGroupResult::default()
+                            .group_id(group_id.into())
+                            .error_code(
+                                if had_group_state || deleted_committed_offsets {
+                                    ErrorCode::None
+                                } else {
+                                    ErrorCode::GroupIdNotFound
+                                }
+                                .into(),
+                            ),
+                    );
+                }
+            }
+
+            for group in deleted {
+                self.wal_append(WalRecord::GroupDelete { group }).await?;
             }
         }
 
@@ -1212,38 +1700,56 @@ impl Storage for Engine {
         detail: GroupDetail,
         version: Option<Version>,
     ) -> Result<Version, UpdateError<GroupDetail>> {
-        let mut groups = self
-            .groups
-            .write()
-            .map_err(|_| UpdateError::Error(Error::Poison))?;
+        let updated = {
+            let mut groups = self
+                .groups
+                .write()
+                .map_err(|_| UpdateError::Error(Error::Poison))?;
 
-        match (groups.get(group_id), version) {
-            (None, None) => {
-                let version = Version::from(&Uuid::now_v7());
-                _ = groups.insert(group_id.to_owned(), (detail, version.clone()));
-                Ok(version)
+            match (groups.get(group_id), version) {
+                (None, None) => {
+                    let version = Version::from(&Uuid::now_v7());
+                    _ = groups.insert(group_id.to_owned(), (detail.clone(), version.clone()));
+                    version
+                }
+
+                (None, Some(_)) => {
+                    return Err(UpdateError::Error(Error::Message(format!(
+                        "group not found: {group_id}"
+                    ))));
+                }
+
+                (Some((current, stored)), None) => {
+                    return Err(UpdateError::Outdated {
+                        current: Box::new(current.clone()),
+                        version: stored.clone(),
+                    });
+                }
+
+                (Some((_, stored)), Some(version)) if stored == &version => {
+                    let version = Version::from(&Uuid::now_v7());
+                    _ = groups.insert(group_id.to_owned(), (detail.clone(), version.clone()));
+                    version
+                }
+
+                (Some((current, stored)), Some(_)) => {
+                    return Err(UpdateError::Outdated {
+                        current: Box::new(current.clone()),
+                        version: stored.clone(),
+                    });
+                }
             }
+        };
 
-            (None, Some(_)) => Err(UpdateError::Error(Error::Message(format!(
-                "group not found: {group_id}"
-            )))),
+        self.wal_append(WalRecord::GroupUpdate {
+            group: group_id.to_owned(),
+            detail,
+            version: updated.clone(),
+        })
+        .await
+        .map_err(UpdateError::Error)?;
 
-            (Some((current, stored)), None) => Err(UpdateError::Outdated {
-                current: Box::new(current.clone()),
-                version: stored.clone(),
-            }),
-
-            (Some((_, stored)), Some(version)) if stored == &version => {
-                let version = Version::from(&Uuid::now_v7());
-                _ = groups.insert(group_id.to_owned(), (detail, version.clone()));
-                Ok(version)
-            }
-
-            (Some((current, stored)), Some(_)) => Err(UpdateError::Outdated {
-                current: Box::new(current.clone()),
-                version: stored.clone(),
-            }),
-        }
+        Ok(updated)
     }
 
     async fn init_producer(
@@ -1259,7 +1765,7 @@ impl Storage for Engine {
         }
 
         if let Some(transaction_id) = transaction_id {
-            let outcome = {
+            let (outcome, wal_record) = {
                 let mut coord = self.coord.lock().await;
 
                 match (producer_id, producer_epoch) {
@@ -1288,11 +1794,18 @@ impl Storage for Engine {
                                     .transactions
                                     .insert(transaction_id.to_owned(), Txn { producer: id, epochs });
 
-                                InitProducer::Completed(ProducerIdResponse {
-                                    id,
-                                    epoch: 0,
-                                    error: ErrorCode::None,
-                                })
+                                (
+                                    InitProducer::Completed(ProducerIdResponse {
+                                        id,
+                                        epoch: 0,
+                                        error: ErrorCode::None,
+                                    }),
+                                    Some(WalRecord::PidAlloc {
+                                        producer_id: id,
+                                        transaction_id: Some(transaction_id.to_owned()),
+                                        transaction_timeout_ms,
+                                    }),
+                                )
                             }
 
                             Some(txn) => {
@@ -1303,13 +1816,14 @@ impl Storage for Engine {
                                     .map(|(epoch, detail)| (*epoch, detail.state));
 
                                 match last {
-                                    Some((current_epoch, state))
-                                        if state == Some(TxnState::Begin) =>
-                                    {
-                                        InitProducer::NeedToRollback {
-                                            producer_id: producer,
-                                            producer_epoch: current_epoch,
-                                        }
+                                    Some((current_epoch, Some(TxnState::Begin))) => {
+                                        (
+                                            InitProducer::NeedToRollback {
+                                                producer_id: producer,
+                                                producer_epoch: current_epoch,
+                                            },
+                                            None,
+                                        )
                                     }
 
                                     Some((current_epoch, _)) => {
@@ -1331,18 +1845,29 @@ impl Storage for Engine {
                                             );
                                         }
 
-                                        InitProducer::Completed(ProducerIdResponse {
-                                            id: producer,
-                                            epoch,
-                                            error: ErrorCode::None,
-                                        })
+                                        (
+                                            InitProducer::Completed(ProducerIdResponse {
+                                                id: producer,
+                                                epoch,
+                                                error: ErrorCode::None,
+                                            }),
+                                            Some(WalRecord::EpochBump {
+                                                transaction_id: transaction_id.to_owned(),
+                                                producer_id: producer,
+                                                producer_epoch: epoch,
+                                                transaction_timeout_ms,
+                                            }),
+                                        )
                                     }
 
-                                    None => InitProducer::Completed(ProducerIdResponse {
-                                        id: -1,
-                                        epoch: -1,
-                                        error: ErrorCode::UnknownServerError,
-                                    }),
+                                    None => (
+                                        InitProducer::Completed(ProducerIdResponse {
+                                            id: -1,
+                                            epoch: -1,
+                                            error: ErrorCode::UnknownServerError,
+                                        }),
+                                        None,
+                                    ),
                                 }
                             }
                         }
@@ -1350,14 +1875,21 @@ impl Storage for Engine {
 
                     (producer, epoch) => {
                         error!(?producer, ?epoch);
-                        InitProducer::Completed(ProducerIdResponse {
-                            id: -1,
-                            epoch: -1,
-                            error: ErrorCode::UnknownServerError,
-                        })
+                        (
+                            InitProducer::Completed(ProducerIdResponse {
+                                id: -1,
+                                epoch: -1,
+                                error: ErrorCode::UnknownServerError,
+                            }),
+                            None,
+                        )
                     }
                 }
             };
+
+            if let Some(record) = wal_record {
+                self.wal_append(record).await?;
+            }
 
             match outcome {
                 InitProducer::Completed(completed) => Ok(completed),
@@ -1394,36 +1926,49 @@ impl Storage for Engine {
                 }
             }
         } else {
-            let mut coord = self.coord.lock().await;
+            let response = {
+                let mut coord = self.coord.lock().await;
 
-            match (producer_id, producer_epoch) {
-                (Some(-1), Some(-1)) => {
-                    let producer = coord
-                        .producers
-                        .last_key_value()
-                        .map_or(1, |(k, _v)| k + 1);
+                match (producer_id, producer_epoch) {
+                    (Some(-1), Some(-1)) => {
+                        let producer = coord
+                            .producers
+                            .last_key_value()
+                            .map_or(1, |(k, _v)| k + 1);
 
-                    let epoch = 0;
-                    let mut pd = ProducerDetail::default();
-                    _ = pd.sequences.insert(epoch, BTreeMap::new());
-                    _ = coord.producers.insert(producer, pd);
+                        let epoch = 0;
+                        let mut pd = ProducerDetail::default();
+                        _ = pd.sequences.insert(epoch, BTreeMap::new());
+                        _ = coord.producers.insert(producer, pd);
 
-                    Ok(ProducerIdResponse {
-                        id: producer,
-                        epoch,
-                        ..Default::default()
-                    })
+                        ProducerIdResponse {
+                            id: producer,
+                            epoch,
+                            ..Default::default()
+                        }
+                    }
+
+                    (producer, epoch) => {
+                        error!(?producer, ?epoch);
+                        ProducerIdResponse {
+                            id: -1,
+                            epoch: -1,
+                            error: ErrorCode::UnknownServerError,
+                        }
+                    }
                 }
+            };
 
-                (producer, epoch) => {
-                    error!(?producer, ?epoch);
-                    Ok(ProducerIdResponse {
-                        id: -1,
-                        epoch: -1,
-                        error: ErrorCode::UnknownServerError,
-                    })
-                }
+            if response.error == ErrorCode::None {
+                self.wal_append(WalRecord::PidAlloc {
+                    producer_id: response.id,
+                    transaction_id: None,
+                    transaction_timeout_ms: 0,
+                })
+                .await?;
             }
+
+            Ok(response)
         }
     }
 
@@ -1448,56 +1993,75 @@ impl Storage for Engine {
                 producer_epoch,
                 ref topics,
             } => {
-                let mut coord = self.coord.lock().await;
+                let started_at = SystemTime::now();
 
-                let txn_detail =
-                    match coord.txn_detail_mut(&transaction_id, producer_id, producer_epoch) {
-                        Ok(txn_detail) => txn_detail,
-                        Err(Error::Api(error_code)) => {
-                            return Ok(Self::txn_add_partitions_response(topics, error_code));
-                        }
-                        Err(otherwise) => return Err(otherwise),
-                    };
+                let (results, partitions) = {
+                    let mut coord = self.coord.lock().await;
 
-                // A terminal txn at this epoch being re-begun (classic clients
-                // reuse the epoch across transactions) must not leak its
-                // previous incarnation's payload into the new one.
-                if txn_detail.state.is_some_and(|state| {
-                    matches!(state, TxnState::Committed | TxnState::Aborted)
-                }) {
-                    txn_detail.produces.clear();
-                    txn_detail.offsets.clear();
-                }
+                    let txn_detail =
+                        match coord.txn_detail_mut(&transaction_id, producer_id, producer_epoch)
+                        {
+                            Ok(txn_detail) => txn_detail,
+                            Err(Error::Api(error_code)) => {
+                                return Ok(Self::txn_add_partitions_response(topics, error_code));
+                            }
+                            Err(otherwise) => return Err(otherwise),
+                        };
 
-                let mut results = vec![];
-
-                for topic in topics {
-                    let mut results_by_partition = vec![];
-
-                    for partition_index in topic.partitions.as_deref().unwrap_or(&[]) {
-                        _ = txn_detail
-                            .produces
-                            .entry(topic.name.clone())
-                            .or_default()
-                            .entry(*partition_index)
-                            .or_default();
-
-                        results_by_partition.push(
-                            AddPartitionsToTxnPartitionResult::default()
-                                .partition_index(*partition_index)
-                                .partition_error_code(i16::from(ErrorCode::None)),
-                        );
+                    // A terminal txn at this epoch being re-begun (classic
+                    // clients reuse the epoch across transactions) must not
+                    // leak its previous incarnation's payload into the new one.
+                    if txn_detail.state.is_some_and(|state| {
+                        matches!(state, TxnState::Committed | TxnState::Aborted)
+                    }) {
+                        txn_detail.produces.clear();
+                        txn_detail.offsets.clear();
                     }
 
-                    results.push(
-                        AddPartitionsToTxnTopicResult::default()
-                            .name(topic.name.clone())
-                            .results_by_partition(Some(results_by_partition)),
-                    )
-                }
+                    let mut results = vec![];
+                    let mut partitions = vec![];
 
-                txn_detail.started_at = Some(SystemTime::now());
-                txn_detail.state = Some(TxnState::Begin);
+                    for topic in topics {
+                        let mut results_by_partition = vec![];
+
+                        for partition_index in topic.partitions.as_deref().unwrap_or(&[]) {
+                            _ = txn_detail
+                                .produces
+                                .entry(topic.name.clone())
+                                .or_default()
+                                .entry(*partition_index)
+                                .or_default();
+
+                            partitions.push((topic.name.clone(), *partition_index));
+
+                            results_by_partition.push(
+                                AddPartitionsToTxnPartitionResult::default()
+                                    .partition_index(*partition_index)
+                                    .partition_error_code(i16::from(ErrorCode::None)),
+                            );
+                        }
+
+                        results.push(
+                            AddPartitionsToTxnTopicResult::default()
+                                .name(topic.name.clone())
+                                .results_by_partition(Some(results_by_partition)),
+                        )
+                    }
+
+                    txn_detail.started_at = Some(started_at);
+                    txn_detail.state = Some(TxnState::Begin);
+
+                    (results, partitions)
+                };
+
+                self.wal_append(WalRecord::TxnBegin {
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    started_at,
+                    partitions,
+                })
+                .await?;
 
                 Ok(TxnAddPartitionsResponse::VersionZeroToThree(results))
             }
@@ -1512,56 +2076,71 @@ impl Storage for Engine {
         &self,
         offsets: TxnOffsetCommitRequest,
     ) -> Result<Vec<TxnOffsetCommitResponseTopic>> {
-        let mut coord = self.coord.lock().await;
+        let (responses, stored) = {
+            let mut coord = self.coord.lock().await;
 
-        let txn_detail = match coord.txn_detail_mut(
-            &offsets.transaction_id,
-            offsets.producer_id,
-            offsets.producer_epoch,
-        ) {
-            Ok(txn_detail) => txn_detail,
-            Err(Error::Api(error_code)) => {
-                return Ok(Self::txn_offset_commit_response_error(&offsets, error_code));
+            let txn_detail = match coord.txn_detail_mut(
+                &offsets.transaction_id,
+                offsets.producer_id,
+                offsets.producer_epoch,
+            ) {
+                Ok(txn_detail) => txn_detail,
+                Err(Error::Api(error_code)) => {
+                    return Ok(Self::txn_offset_commit_response_error(&offsets, error_code));
+                }
+                Err(otherwise) => return Err(otherwise),
+            };
+
+            let mut responses = vec![];
+            let mut stored = vec![];
+
+            for topic in &offsets.topics {
+                let mut partition_responses = vec![];
+
+                if let Some(partitions) = topic.partitions.as_deref() {
+                    for partition in partitions {
+                        let co = state::TxnCommitOffset {
+                            committed_offset: partition.committed_offset,
+                            leader_epoch: partition.committed_leader_epoch,
+                            metadata: partition.committed_metadata.clone(),
+                        };
+
+                        _ = txn_detail
+                            .offsets
+                            .entry(offsets.group_id.clone())
+                            .or_default()
+                            .entry(topic.name.clone())
+                            .or_default()
+                            .insert(partition.partition_index, co.clone());
+
+                        stored.push((topic.name.clone(), partition.partition_index, co));
+
+                        partition_responses.push(
+                            TxnOffsetCommitResponsePartition::default()
+                                .partition_index(partition.partition_index)
+                                .error_code(ErrorCode::None.into()),
+                        );
+                    }
+                }
+
+                responses.push(
+                    TxnOffsetCommitResponseTopic::default()
+                        .name(topic.name.to_string())
+                        .partitions(Some(partition_responses)),
+                );
             }
-            Err(otherwise) => return Err(otherwise),
+
+            (responses, stored)
         };
 
-        let mut responses = vec![];
-
-        for topic in &offsets.topics {
-            let mut partition_responses = vec![];
-
-            if let Some(partitions) = topic.partitions.as_deref() {
-                for partition in partitions {
-                    _ = txn_detail
-                        .offsets
-                        .entry(offsets.group_id.clone())
-                        .or_default()
-                        .entry(topic.name.clone())
-                        .or_default()
-                        .insert(
-                            partition.partition_index,
-                            state::TxnCommitOffset {
-                                committed_offset: partition.committed_offset,
-                                leader_epoch: partition.committed_leader_epoch,
-                                metadata: partition.committed_metadata.clone(),
-                            },
-                        );
-
-                    partition_responses.push(
-                        TxnOffsetCommitResponsePartition::default()
-                            .partition_index(partition.partition_index)
-                            .error_code(ErrorCode::None.into()),
-                    );
-                }
-            }
-
-            responses.push(
-                TxnOffsetCommitResponseTopic::default()
-                    .name(topic.name.to_string())
-                    .partitions(Some(partition_responses)),
-            );
-        }
+        self.wal_append(WalRecord::TxnOffsets {
+            transaction_id: offsets.transaction_id.clone(),
+            producer_id: offsets.producer_id,
+            producer_epoch: offsets.producer_epoch,
+            group: offsets.group_id.clone(),
+            offsets: stored,
+        })
+        .await?;
 
         Ok(responses)
     }
@@ -1574,16 +2153,24 @@ impl Storage for Engine {
         committed: bool,
     ) -> Result<ErrorCode> {
         // Phase 1: validate and move Begin to PrepareCommit/PrepareAbort,
-        // collecting the partitions this txn produced to.
-        let produced: Vec<Topition> = {
+        // collecting the partitions this txn produced to. The prepared
+        // ranges are WAL'd before any marker is written, so a crash
+        // mid-phase-2 recovers as an in-doubt txn with known ranges.
+        let (transitioned, produced, prepared_ranges): (
+            bool,
+            Vec<Topition>,
+            Vec<(String, i32, state::TxnProduceOffset)>,
+        ) = {
             let mut coord = self.coord.lock().await;
 
             let txn_detail =
                 coord.txn_detail_mut(transaction_id, producer_id, producer_epoch)?;
 
             let mut produced = vec![];
+            let mut prepared_ranges = vec![];
+            let transitioned = txn_detail.state == Some(TxnState::Begin);
 
-            if txn_detail.state == Some(TxnState::Begin) {
+            if transitioned {
                 txn_detail.state = Some(if committed {
                     TxnState::PrepareCommit
                 } else {
@@ -1592,15 +2179,27 @@ impl Storage for Engine {
 
                 for (topic, partitions) in &txn_detail.produces {
                     for (partition, offset_range) in partitions {
-                        if offset_range.is_some() {
+                        if let Some(range) = offset_range {
                             produced.push(Topition::new(topic.to_owned(), *partition));
+                            prepared_ranges.push((topic.clone(), *partition, *range));
                         }
                     }
                 }
             }
 
-            produced
+            (transitioned, produced, prepared_ranges)
         };
+
+        if transitioned {
+            self.wal_append(WalRecord::TxnPrepare {
+                transaction_id: transaction_id.to_owned(),
+                producer_id,
+                producer_epoch,
+                committed,
+                produced: prepared_ranges,
+            })
+            .await?;
+        }
 
         // Phase 2: write the end-txn control marker to every produced
         // partition through the normal produce path (extends each range so
@@ -1740,6 +2339,40 @@ impl Storage for Engine {
             effects
         };
 
+        // Terminal transitions are durable before their effects apply: one
+        // record per resolved txn, one group-committed fsync for the lot.
+        let mut last_ack = None;
+
+        for effect in &effects {
+            let (ack, _) = {
+                let wal = self.wal.read()?;
+                wal.append(&WalRecord::TxnTerminal {
+                    transaction_id: effect.transaction.clone(),
+                    producer_id: effect.producer_id,
+                    producer_epoch: effect.producer_epoch,
+                    committed: !effect.aborting,
+                    aborted: if effect.aborting {
+                        effect
+                            .ranges
+                            .iter()
+                            .map(|(topition, range)| {
+                                (topition.topic().to_owned(), topition.partition(), *range)
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    },
+                })?
+            };
+
+            last_ack = Some(ack);
+        }
+
+        if let Some(ack) = last_ack {
+            ack.await
+                .map_err(|_| Error::Message("nvme wal flusher dropped".into()))??;
+        }
+
         // Per-partition: release each resolved txn's LSO pin; on abort,
         // publish its ranges into the partition's aborted index. Waking
         // read_committed fetch waiters happens once per touched partition.
@@ -1758,11 +2391,17 @@ impl Storage for Engine {
                         _ = inner.open_txns.remove(&open_key);
 
                         if effect.aborting {
-                            inner.aborted.push(AbortedRange {
+                            let aborted = AbortedRange {
                                 producer: effect.producer_id,
                                 offset_start: range.offset_start,
                                 offset_end: range.offset_end,
-                            });
+                            };
+
+                            // A snapshot capturing this push can coexist with
+                            // its TxnTerminal in the next WAL: replay dedupes.
+                            if !inner.aborted.contains(&aborted) {
+                                inner.aborted.push(aborted);
+                            }
                         }
                     }
 
@@ -1790,7 +2429,19 @@ impl Storage for Engine {
         Ok(ErrorCode::None)
     }
 
-    async fn maintain(&self, _now: SystemTime) -> Result<()> {
+    async fn maintain(&self, now: SystemTime) -> Result<()> {
+        self.apply_retention(now).await?;
+
+        // Snapshot when the WAL has grown, retiring the replay chain.
+        let bytes = {
+            let wal = self.wal.read()?;
+            wal.bytes_since_open()?
+        };
+
+        if bytes > 0 {
+            self.snapshot_now().await?;
+        }
+
         Ok(())
     }
 
@@ -1866,7 +2517,411 @@ impl Storage for Engine {
 
 #[cfg(test)]
 mod tests {
+    use tansu_sans_io::record::Record;
+
     use super::*;
+
+    async fn open(dir: &std::path::Path) -> Result<Engine> {
+        Engine::open(
+            "test-cluster",
+            111,
+            dir,
+            Url::parse("tcp://127.0.0.1:9092").expect("url"),
+            None,
+            Config::default(),
+        )
+        .await
+    }
+
+    fn batch(
+        producer_id: i64,
+        producer_epoch: i16,
+        base_sequence: i32,
+        transactional: bool,
+        value: &str,
+    ) -> Result<deflated::Batch> {
+        let mut attributes = BatchAttribute::default();
+        if transactional {
+            attributes = attributes.transaction(true);
+        }
+
+        inflated::Batch::builder()
+            .record(Record::builder().value(Bytes::copy_from_slice(value.as_bytes()).into()))
+            .attributes(attributes.into())
+            .producer_id(producer_id)
+            .producer_epoch(producer_epoch)
+            .base_sequence(base_sequence)
+            .build()
+            .and_then(TryInto::try_into)
+            .map_err(Into::into)
+    }
+
+    fn topic(name: &str, partitions: i32) -> CreatableTopic {
+        CreatableTopic::default()
+            .name(name.into())
+            .num_partitions(partitions)
+            .replication_factor(0)
+            .assignments(Some([].into()))
+            .configs(Some([].into()))
+    }
+
+    #[tokio::test]
+    async fn recovery_round_trip() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let topition = Topition::new("recovered", 0);
+
+        {
+            let engine = open(dir.path()).await?;
+
+            _ = engine.create_topic(topic("recovered", 1), false).await?;
+
+            // Plain idempotent producer.
+            let pid = engine.init_producer(None, 0, Some(-1), Some(-1)).await?;
+            for sequence in 0..3 {
+                _ = engine
+                    .produce(
+                        None,
+                        &topition,
+                        batch(pid.id, pid.epoch, sequence, false, "plain")?,
+                    )
+                    .await?;
+            }
+
+            // A committed transaction, then an aborted one at the same epoch.
+            let txn = engine
+                .init_producer(Some("txn-a"), 10_000, Some(-1), Some(-1))
+                .await?;
+
+            for (committed, base_sequence) in [(true, 0), (false, 1)] {
+                _ = engine
+                    .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                        transaction_id: "txn-a".into(),
+                        producer_id: txn.id,
+                        producer_epoch: txn.epoch,
+                        topics: [
+                            tansu_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic::default()
+                                .name("recovered".into())
+                                .partitions(Some([0].into())),
+                        ]
+                        .into(),
+                    })
+                    .await?;
+
+                _ = engine
+                    .produce(
+                        Some("txn-a"),
+                        &topition,
+                        batch(txn.id, txn.epoch, base_sequence, true, "txn")?,
+                    )
+                    .await?;
+
+                assert_eq!(
+                    ErrorCode::None,
+                    engine.txn_end("txn-a", txn.id, txn.epoch, committed).await?
+                );
+            }
+
+            // Consumer offsets survive too.
+            _ = engine
+                .offset_commit(
+                    "group-a",
+                    None,
+                    &[(topition.clone(), OffsetCommitRequest::default().offset(2))],
+                )
+                .await?;
+
+            let stage = engine.offset_stage(&topition).await?;
+            assert_eq!(7, stage.high_watermark()); // 3 plain + (1+marker) x 2
+            assert_eq!(stage.high_watermark(), stage.last_stable());
+        }
+
+        // Reopen: snapshot + WAL + segment scan must reproduce everything.
+        let engine = open(dir.path()).await?;
+
+        let stage = engine.offset_stage(&topition).await?;
+        assert_eq!(7, stage.high_watermark());
+        assert_eq!(stage.high_watermark(), stage.last_stable());
+        assert_eq!(0, stage.log_start());
+
+        let batches = engine
+            .fetch(
+                &topition,
+                0,
+                1,
+                1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_millis(100),
+            )
+            .await?;
+        assert_eq!(7, batches.len());
+        assert_eq!(
+            (0..7).collect::<Vec<i64>>(),
+            batches.iter().map(|batch| batch.base_offset).collect::<Vec<_>>()
+        );
+
+        let aborted = engine.aborted_transactions(&topition, 0).await?;
+        assert_eq!(1, aborted.len());
+        assert_eq!(5, aborted[0].first_offset); // 3 plain + txn(3) + marker(4)
+
+        let offsets = engine
+            .offset_fetch(Some("group-a"), std::slice::from_ref(&topition), Some(false))
+            .await?;
+        assert_eq!(Some(&2), offsets.get(&topition));
+
+        // Sequences recovered: replaying an old sequence is a duplicate.
+        let duplicate = engine
+            .produce(None, &topition, batch(1, 0, 0, false, "dup")?)
+            .await;
+        assert!(matches!(
+            duplicate,
+            Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
+        ));
+
+        // And the log continues where it left off.
+        let offset = engine
+            .produce(None, &topition, batch(1, 0, 3, false, "after")?)
+            .await?;
+        assert_eq!(7, offset);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn torn_tails_are_truncated() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let topition = Topition::new("torn", 0);
+
+        {
+            let engine = open(dir.path()).await?;
+            _ = engine.create_topic(topic("torn", 1), false).await?;
+
+            let pid = engine.init_producer(None, 0, Some(-1), Some(-1)).await?;
+            for sequence in 0..3 {
+                _ = engine
+                    .produce(
+                        None,
+                        &topition,
+                        batch(pid.id, pid.epoch, sequence, false, "keep")?,
+                    )
+                    .await?;
+            }
+        }
+
+        // Tear the segment and WAL tails as a crash mid-append would.
+        let partition_dir = dir.path().join("topics").join("torn-0000000000");
+        for base in log::segment_bases(&partition_dir)? {
+            let path = log::segment_path(&partition_dir, base);
+            let mut bytes = std::fs::read(&path).expect("segment");
+            bytes.extend_from_slice(&[0x54, 0x01, 0x01, 0x00, 0xff, 0xff]);
+            std::fs::write(&path, &bytes).expect("torn segment");
+        }
+
+        for seq in wal::wal_seqs(&dir.path().join("wal"))? {
+            let path = dir.path().join("wal").join(format!("{seq:020}.wal"));
+            let mut bytes = std::fs::read(&path).expect("wal");
+            bytes.extend_from_slice(b"torn");
+            std::fs::write(&path, &bytes).expect("torn wal");
+        }
+
+        let engine = open(dir.path()).await?;
+
+        let stage = engine.offset_stage(&topition).await?;
+        assert_eq!(3, stage.high_watermark());
+
+        let batches = engine
+            .fetch(
+                &topition,
+                0,
+                1,
+                1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_millis(100),
+            )
+            .await?;
+        assert_eq!(3, batches.len());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retention_deletes_sealed_segments() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let topition = Topition::new("retained", 0);
+
+        let engine = Engine::open(
+            "test-cluster",
+            111,
+            dir.path(),
+            Url::parse("tcp://127.0.0.1:9092").expect("url"),
+            None,
+            Config {
+                // Tiny segments: every batch seals the previous segment.
+                segment_bytes: 64,
+                ..Config::default()
+            },
+        )
+        .await?;
+
+        _ = engine
+            .create_topic(
+                topic("retained", 1).configs(Some(
+                    [tansu_sans_io::create_topics_request::CreatableTopicConfig::default()
+                        .name("retention.ms".into())
+                        .value(Some("1000".into()))]
+                    .into(),
+                )),
+                false,
+            )
+            .await?;
+
+        let pid = engine.init_producer(None, 0, Some(-1), Some(-1)).await?;
+        for sequence in 0..5 {
+            _ = engine
+                .produce(
+                    None,
+                    &topition,
+                    batch(pid.id, pid.epoch, sequence, false, "expiring")?,
+                )
+                .await?;
+        }
+
+        let partition_dir = dir.path().join("topics").join("retained-0000000000");
+        assert!(log::segment_bases(&partition_dir)?.len() >= 4);
+
+        // Everything sealed is far past retention; the active tail stays.
+        engine
+            .maintain(SystemTime::now() + StdDuration::from_secs(3600))
+            .await?;
+
+        let stage = engine.offset_stage(&topition).await?;
+        assert_eq!(5, stage.high_watermark());
+        assert_eq!(4, stage.log_start());
+        assert_eq!(1, log::segment_bases(&partition_dir)?.len());
+
+        let batches = engine
+            .fetch(
+                &topition,
+                0,
+                1,
+                1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_millis(100),
+            )
+            .await?;
+        assert_eq!(1, batches.len());
+        assert_eq!(4, batches[0].base_offset);
+
+        // Recovery with a log start beyond deleted segments.
+        drop(engine);
+        let engine = open(dir.path()).await?;
+
+        let stage = engine.offset_stage(&topition).await?;
+        assert_eq!(5, stage.high_watermark());
+        assert_eq!(4, stage.log_start());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_producers_get_dense_unique_offsets() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let topition = Topition::new("dense", 0);
+
+        let engine = std::sync::Arc::new(open(dir.path()).await?);
+        _ = engine.create_topic(topic("dense", 1), false).await?;
+
+        const TASKS: usize = 8;
+        const EACH: usize = 25;
+
+        let mut handles = vec![];
+
+        for task in 0..TASKS {
+            let engine = engine.clone();
+            let topition = topition.clone();
+
+            handles.push(tokio::spawn(async move {
+                let mut offsets = vec![];
+
+                for i in 0..EACH {
+                    let batch = batch(-1, -1, -1, false, &format!("t{task}-{i}"))
+                        .expect("batch");
+                    offsets.push(
+                        engine
+                            .produce(None, &topition, batch)
+                            .await
+                            .expect("produce"),
+                    );
+                }
+
+                offsets
+            }));
+        }
+
+        let mut all = vec![];
+        for handle in handles {
+            all.extend(handle.await.expect("join"));
+        }
+
+        all.sort_unstable();
+        let expected: Vec<i64> = (0..(TASKS * EACH) as i64).collect();
+        assert_eq!(expected, all, "offsets must be dense and unique");
+
+        let stage = engine.offset_stage(&topition).await?;
+        assert_eq!((TASKS * EACH) as i64, stage.high_watermark());
+        assert_eq!(stage.high_watermark(), stage.last_stable());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_reads_evicted_batches_from_disk() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let topition = Topition::new("cold", 0);
+
+        let engine = Engine::open(
+            "test-cluster",
+            111,
+            dir.path(),
+            Url::parse("tcp://127.0.0.1:9092").expect("url"),
+            None,
+            Config {
+                // No tail cache: every fetch preads the segment, including
+                // the active one (the librdkafka 0041 regression).
+                tail_cache_bytes: 0,
+                ..Config::default()
+            },
+        )
+        .await?;
+
+        _ = engine.create_topic(topic("cold", 1), false).await?;
+
+        let pid = engine.init_producer(None, 0, Some(-1), Some(-1)).await?;
+        for sequence in 0..4 {
+            _ = engine
+                .produce(
+                    None,
+                    &topition,
+                    batch(pid.id, pid.epoch, sequence, false, "cold read")?,
+                )
+                .await?;
+        }
+
+        let batches = engine
+            .fetch(
+                &topition,
+                0,
+                1,
+                1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_millis(100),
+            )
+            .await?;
+
+        assert_eq!(4, batches.len());
+        assert_eq!(0, batches[0].base_offset);
+
+        Ok(())
+    }
 
     #[test]
     fn config_defaults_from_bare_url() -> Result<()> {

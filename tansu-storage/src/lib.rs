@@ -2477,16 +2477,19 @@ impl Builder<i32, String, Url, Url> {
                 } else {
                     let path = self.storage.path();
                     std::fs::create_dir_all(path)?;
+                    let config = nvme::Config::from_url(&self.storage)?;
 
-                    nvme::Config::from_url(&self.storage)
-                        .map(|config| {
-                            nvme::Engine::new(self.cluster_id.as_str(), self.node_id, path)
-                                .advertised_listener(self.advertised_listener.clone())
-                                .schemas(self.schema_registry)
-                                .config(config)
-                        })
-                        .map(|storage| Box::new(storage) as Box<dyn Storage>)
-                        .map(Arc::new)
+                    nvme::Engine::open(
+                        self.cluster_id.as_str(),
+                        self.node_id,
+                        path,
+                        self.advertised_listener.clone(),
+                        self.schema_registry,
+                        config,
+                    )
+                    .await
+                    .map(|storage| Box::new(storage) as Box<dyn Storage>)
+                    .map(Arc::new)
                 }
             }
 
