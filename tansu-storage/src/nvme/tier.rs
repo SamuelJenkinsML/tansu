@@ -399,7 +399,11 @@ async fn tick(
             }) {
                 let old = inner.writer.take().expect("checked above");
                 _ = old.flusher.seal();
-                debug!(?topition, base = old.base_offset, "aged active segment sealed");
+                debug!(
+                    ?topition,
+                    base = old.base_offset,
+                    "aged active segment sealed"
+                );
                 _ = inner.read_files.insert(old.base_offset, old.file);
             }
 
@@ -476,15 +480,9 @@ async fn tick(
                         let mut inner = state.inner.lock()?;
                         let active = inner.writer.as_ref().map(|writer| writer.base_offset);
 
-                        let Some(base) = inner
-                            .uploaded
-                            .iter()
-                            .copied()
-                            .find(|base| {
-                                Some(*base) != active
-                                    && log::segment_path(&inner.dir, *base).exists()
-                            })
-                        else {
+                        let Some(base) = inner.uploaded.iter().copied().find(|base| {
+                            Some(*base) != active && log::segment_path(&inner.dir, *base).exists()
+                        }) else {
                             break;
                         };
 

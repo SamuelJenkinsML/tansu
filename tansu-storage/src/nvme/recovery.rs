@@ -142,9 +142,7 @@ pub(crate) async fn recover(
         .map(|doc| {
             doc.groups
                 .iter()
-                .map(|(group, detail, version)| {
-                    (group.clone(), (detail.clone(), version.clone()))
-                })
+                .map(|(group, detail, version)| (group.clone(), (detail.clone(), version.clone())))
                 .collect()
         })
         .unwrap_or_default();
@@ -186,16 +184,19 @@ pub(crate) async fn recover(
     let existing = wal::wal_seqs(&wal_dir)?;
 
     for seq in existing.iter().filter(|seq| **seq > snapshot_seq) {
-        wal::replay(&wal_dir.join(format!("{seq:020}.{}", wal::WAL_SUFFIX)), |record| {
-            replayed += 1;
-            apply(
-                record,
-                &mut coord,
-                &mut groups,
-                &mut group_offsets,
-                &mut skeletons,
-            );
-        })?;
+        wal::replay(
+            &wal_dir.join(format!("{seq:020}.{}", wal::WAL_SUFFIX)),
+            |record| {
+                replayed += 1;
+                apply(
+                    record,
+                    &mut coord,
+                    &mut groups,
+                    &mut group_offsets,
+                    &mut skeletons,
+                );
+            },
+        )?;
     }
 
     let next_seq = existing.last().copied().unwrap_or(0).max(snapshot_seq) + 1;
@@ -358,7 +359,11 @@ pub(crate) async fn recover(
             inner.log_start = 0;
             _ = inner.advance_log_start(log_start);
 
-            debug!(?topition, tiered = inner.uploaded.len(), next = inner.next_offset);
+            debug!(
+                ?topition,
+                tiered = inner.uploaded.len(),
+                next = inner.next_offset
+            );
         }
     }
 
@@ -386,18 +391,15 @@ pub(crate) async fn recover(
 
                     if let Some(state) = partitions.get(&topition) {
                         let mut inner = state.inner.lock()?;
-                        _ = inner
-                            .open_txns
-                            .insert(
-                                (transaction_id.clone(), txn.producer, *epoch),
-                                range.offset_start,
-                            );
+                        _ = inner.open_txns.insert(
+                            (transaction_id.clone(), txn.producer, *epoch),
+                            range.offset_start,
+                        );
                     }
                 }
             }
 
-            if let Some(state @ (TxnState::PrepareCommit | TxnState::PrepareAbort)) = detail.state
-            {
+            if let Some(state @ (TxnState::PrepareCommit | TxnState::PrepareAbort)) = detail.state {
                 in_doubt.push((
                     transaction_id.clone(),
                     txn.producer,
@@ -511,9 +513,7 @@ fn scan_partition(
 
             for scanned in batches {
                 let batch = tansu_sans_io::record::deflated::Batch::try_from(scanned.batch)
-                    .map_err(|err| {
-                        Error::Message(format!("nvme scan decode {path:?}: {err:?}"))
-                    })?;
+                    .map_err(|err| Error::Message(format!("nvme scan decode {path:?}: {err:?}")))?;
 
                 let attributes = BatchAttribute::try_from(batch.attributes)?;
                 let offset = scanned.base_offset;
@@ -554,7 +554,8 @@ fn scan_partition(
                         .entry(topition.partition())
                         .or_default();
 
-                    *sequences = (*sequences).max(batch.base_sequence + batch.last_offset_delta + 1);
+                    *sequences =
+                        (*sequences).max(batch.base_sequence + batch.last_offset_delta + 1);
                 }
 
                 // Produce ranges of still-open (Begin) transactions were not
@@ -822,10 +823,7 @@ fn apply(
 
         WalRecord::GroupOffsetCommit { group, offsets } => {
             for (topic, partition, commit) in offsets {
-                _ = group_offsets.insert(
-                    (group.clone(), Topition::new(topic, partition)),
-                    commit,
-                );
+                _ = group_offsets.insert((group.clone(), Topition::new(topic, partition)), commit);
             }
         }
 

@@ -189,7 +189,10 @@ impl Wal {
 
     /// Append one record and return the durability ack to await, plus the
     /// framed record's size on disk.
-    pub(crate) fn append(&self, record: &WalRecord) -> Result<(oneshot::Receiver<Result<()>>, u64)> {
+    pub(crate) fn append(
+        &self,
+        record: &WalRecord,
+    ) -> Result<(oneshot::Receiver<Result<()>>, u64)> {
         let payload = serde_json::to_vec(record)?;
         let framed = frame::encode(FrameType::Wal, &payload);
 

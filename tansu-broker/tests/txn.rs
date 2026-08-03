@@ -1678,21 +1678,19 @@ where
 
         assert_eq!(
             ErrorCode::None,
-            sc.txn_end(
-                transaction.as_str(),
-                producer.id,
-                producer.epoch,
-                committed
-            )
-            .await
-            .inspect_err(|err| error!(?err, incarnation, committed))?
+            sc.txn_end(transaction.as_str(), producer.id, producer.epoch, committed)
+                .await
+                .inspect_err(|err| error!(?err, incarnation, committed))?
         );
     }
 
     // 3 aborted + marker + 3 committed + marker.
     let high_watermark = i64::from(num_records) * 2 + 2;
 
-    for isolation_level in [IsolationLevel::ReadUncommitted, IsolationLevel::ReadCommitted] {
+    for isolation_level in [
+        IsolationLevel::ReadUncommitted,
+        IsolationLevel::ReadCommitted,
+    ] {
         let list_offsets = sc
             .list_offsets(isolation_level, &[(topition.clone(), ListOffset::Latest)])
             .await

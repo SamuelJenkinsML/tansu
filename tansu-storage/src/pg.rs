@@ -3734,12 +3734,18 @@ impl Storage for Postgres {
         // abort control markers, advances the LSO, and retains the aborted
         // ranges for read_committed).
         for (transaction_id, producer_id, producer_epoch) in expired {
-            debug!(cluster = self.cluster, transaction_id, producer_id, producer_epoch, "sweep abort");
+            debug!(
+                cluster = self.cluster,
+                transaction_id, producer_id, producer_epoch, "sweep abort"
+            );
             if let Err(err) = self
                 .txn_end(&transaction_id, producer_id, producer_epoch, false)
                 .await
             {
-                error!(?err, transaction_id, producer_id, producer_epoch, "sweep abort failed");
+                error!(
+                    ?err,
+                    transaction_id, producer_id, producer_epoch, "sweep abort failed"
+                );
             }
         }
 

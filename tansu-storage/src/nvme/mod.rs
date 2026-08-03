@@ -351,13 +351,9 @@ impl Engine {
                             .flatten()
                             .and_then(|state| {
                                 state.inner.lock().ok().map(|inner| {
-                                    inner
-                                        .batches
-                                        .range(range.offset_start..)
-                                        .any(|(_, entry)| {
-                                            entry.is_control
-                                                && entry.producer_id == producer_id
-                                        })
+                                    inner.batches.range(range.offset_start..).any(|(_, entry)| {
+                                        entry.is_control && entry.producer_id == producer_id
+                                    })
                                 })
                             })
                             .unwrap_or(false);
@@ -369,7 +365,12 @@ impl Engine {
 
             for (topition, marker_present) in &produced {
                 if !marker_present {
-                    debug!(transaction_id, ?topition, committed, "boot: writing missing marker");
+                    debug!(
+                        transaction_id,
+                        ?topition,
+                        committed,
+                        "boot: writing missing marker"
+                    );
                     _ = self
                         .produce_marker(
                             &transaction_id,
@@ -660,10 +661,7 @@ impl Engine {
             return Ok(partition.clone());
         }
 
-        let dir = self
-            .data_dir
-            .join("topics")
-            .join(PathBuf::from(topition));
+        let dir = self.data_dir.join("topics").join(PathBuf::from(topition));
 
         std::fs::create_dir_all(&dir)
             .map_err(|err| Error::Message(format!("nvme create {dir:?}: {err}")))?;
@@ -782,8 +780,10 @@ impl Engine {
         let partitions = Some(
             (0..metadata.topic.num_partitions)
                 .map(|partition_index| {
-                    let replica_nodes =
-                        Some(vec![self.node; metadata.topic.replication_factor.max(0) as usize]);
+                    let replica_nodes = Some(vec![
+                        self.node;
+                        metadata.topic.replication_factor.max(0) as usize
+                    ]);
 
                     MetadataResponsePartition::default()
                         .error_code(error_code)
@@ -809,10 +809,7 @@ impl Engine {
 
 #[async_trait]
 impl Storage for Engine {
-    async fn register_broker(
-        &self,
-        _broker_registration: BrokerRegistrationRequest,
-    ) -> Result<()> {
+    async fn register_broker(&self, _broker_registration: BrokerRegistrationRequest) -> Result<()> {
         Ok(())
     }
 
@@ -1042,7 +1039,11 @@ impl Storage for Engine {
             && self.disk_usage.load(std::sync::atomic::Ordering::Relaxed)
                 >= self.config.disk_budget_bytes
         {
-            warn!(?topition, budget = self.config.disk_budget_bytes, "disk budget exhausted");
+            warn!(
+                ?topition,
+                budget = self.config.disk_budget_bytes,
+                "disk budget exhausted"
+            );
             return Err(Error::Api(ErrorCode::KafkaStorageError));
         }
 
@@ -1216,8 +1217,7 @@ impl Storage for Engine {
             return Ok(vec![]);
         };
 
-        let deadline = tokio::time::Instant::now()
-            + max_wait.min(self.config.fetch_max_block);
+        let deadline = tokio::time::Instant::now() + max_wait.min(self.config.fetch_max_block);
 
         enum Pending {
             Cached(i64, Bytes),
@@ -1289,12 +1289,7 @@ impl Storage for Engine {
                             )),
                             (None, false) => {
                                 let file = inner.read_handle(entry.segment_base)?;
-                                pending.push(Pending::Disk(
-                                    base,
-                                    file,
-                                    entry.position,
-                                    entry.len,
-                                ));
+                                pending.push(Pending::Disk(base, file, entry.position, entry.len));
                             }
                         }
                     }
@@ -1321,7 +1316,8 @@ impl Storage for Engine {
 
                             (
                                 base,
-                                tier.read_batch(topition, segment_base, position, len).await?,
+                                tier.read_batch(topition, segment_base, position, len)
+                                    .await?,
                             )
                         }
                     };
@@ -1630,7 +1626,9 @@ impl Storage for Engine {
     ) -> Result<()> {
         {
             let mut coord = self.coord.lock().await;
-            _ = coord.scram.remove(&(user.to_owned(), format!("{mechanism:?}")));
+            _ = coord
+                .scram
+                .remove(&(user.to_owned(), format!("{mechanism:?}")));
         }
 
         self.wal_append(WalRecord::ScramDelete {
@@ -1928,7 +1926,10 @@ impl Storage for Engine {
     ) -> Result<ProducerIdResponse> {
         enum InitProducer {
             Completed(ProducerIdResponse),
-            NeedToRollback { producer_id: i64, producer_epoch: i16 },
+            NeedToRollback {
+                producer_id: i64,
+                producer_epoch: i16,
+            },
         }
 
         if let Some(transaction_id) = transaction_id {
@@ -1936,109 +1937,104 @@ impl Storage for Engine {
                 let mut coord = self.coord.lock().await;
 
                 match (producer_id, producer_epoch) {
-                    (Some(-1), Some(-1)) => {
-                        match coord.transactions.get(transaction_id) {
-                            None => {
-                                let id = coord
-                                    .producers
-                                    .last_key_value()
-                                    .map_or(1, |(k, _v)| k + 1);
+                    (Some(-1), Some(-1)) => match coord.transactions.get(transaction_id) {
+                        None => {
+                            let id = coord.producers.last_key_value().map_or(1, |(k, _v)| k + 1);
 
-                                let mut pd = ProducerDetail::default();
-                                _ = pd.sequences.insert(0, BTreeMap::new());
-                                _ = coord.producers.insert(id, pd);
+                            let mut pd = ProducerDetail::default();
+                            _ = pd.sequences.insert(0, BTreeMap::new());
+                            _ = coord.producers.insert(id, pd);
 
-                                let mut epochs = BTreeMap::new();
-                                _ = epochs.insert(
-                                    0,
-                                    TxnDetail {
-                                        transaction_timeout_ms,
-                                        ..Default::default()
+                            let mut epochs = BTreeMap::new();
+                            _ = epochs.insert(
+                                0,
+                                TxnDetail {
+                                    transaction_timeout_ms,
+                                    ..Default::default()
+                                },
+                            );
+
+                            _ = coord.transactions.insert(
+                                transaction_id.to_owned(),
+                                Txn {
+                                    producer: id,
+                                    epochs,
+                                },
+                            );
+
+                            (
+                                InitProducer::Completed(ProducerIdResponse {
+                                    id,
+                                    epoch: 0,
+                                    error: ErrorCode::None,
+                                }),
+                                Some(WalRecord::PidAlloc {
+                                    producer_id: id,
+                                    transaction_id: Some(transaction_id.to_owned()),
+                                    transaction_timeout_ms,
+                                }),
+                            )
+                        }
+
+                        Some(txn) => {
+                            let producer = txn.producer;
+                            let last = txn
+                                .epochs
+                                .last_key_value()
+                                .map(|(epoch, detail)| (*epoch, detail.state));
+
+                            match last {
+                                Some((current_epoch, Some(TxnState::Begin))) => (
+                                    InitProducer::NeedToRollback {
+                                        producer_id: producer,
+                                        producer_epoch: current_epoch,
                                     },
-                                );
+                                    None,
+                                ),
 
-                                _ = coord
-                                    .transactions
-                                    .insert(transaction_id.to_owned(), Txn { producer: id, epochs });
+                                Some((current_epoch, _)) => {
+                                    let epoch = current_epoch + 1;
 
-                                (
-                                    InitProducer::Completed(ProducerIdResponse {
-                                        id,
-                                        epoch: 0,
-                                        error: ErrorCode::None,
-                                    }),
-                                    Some(WalRecord::PidAlloc {
-                                        producer_id: id,
-                                        transaction_id: Some(transaction_id.to_owned()),
-                                        transaction_timeout_ms,
-                                    }),
-                                )
-                            }
-
-                            Some(txn) => {
-                                let producer = txn.producer;
-                                let last = txn
-                                    .epochs
-                                    .last_key_value()
-                                    .map(|(epoch, detail)| (*epoch, detail.state));
-
-                                match last {
-                                    Some((current_epoch, Some(TxnState::Begin))) => {
-                                        (
-                                            InitProducer::NeedToRollback {
-                                                producer_id: producer,
-                                                producer_epoch: current_epoch,
-                                            },
-                                            None,
-                                        )
+                                    if let Some(pd) = coord.producers.get_mut(&producer) {
+                                        _ = pd.sequences.insert(epoch, BTreeMap::new());
                                     }
 
-                                    Some((current_epoch, _)) => {
-                                        let epoch = current_epoch + 1;
-
-                                        if let Some(pd) = coord.producers.get_mut(&producer) {
-                                            _ = pd.sequences.insert(epoch, BTreeMap::new());
-                                        }
-
-                                        if let Some(txn) =
-                                            coord.transactions.get_mut(transaction_id)
-                                        {
-                                            _ = txn.epochs.insert(
-                                                epoch,
-                                                TxnDetail {
-                                                    transaction_timeout_ms,
-                                                    ..Default::default()
-                                                },
-                                            );
-                                        }
-
-                                        (
-                                            InitProducer::Completed(ProducerIdResponse {
-                                                id: producer,
-                                                epoch,
-                                                error: ErrorCode::None,
-                                            }),
-                                            Some(WalRecord::EpochBump {
-                                                transaction_id: transaction_id.to_owned(),
-                                                producer_id: producer,
-                                                producer_epoch: epoch,
+                                    if let Some(txn) = coord.transactions.get_mut(transaction_id) {
+                                        _ = txn.epochs.insert(
+                                            epoch,
+                                            TxnDetail {
                                                 transaction_timeout_ms,
-                                            }),
-                                        )
+                                                ..Default::default()
+                                            },
+                                        );
                                     }
 
-                                    None => (
+                                    (
                                         InitProducer::Completed(ProducerIdResponse {
-                                            id: -1,
-                                            epoch: -1,
-                                            error: ErrorCode::UnknownServerError,
+                                            id: producer,
+                                            epoch,
+                                            error: ErrorCode::None,
                                         }),
-                                        None,
-                                    ),
+                                        Some(WalRecord::EpochBump {
+                                            transaction_id: transaction_id.to_owned(),
+                                            producer_id: producer,
+                                            producer_epoch: epoch,
+                                            transaction_timeout_ms,
+                                        }),
+                                    )
                                 }
+
+                                None => (
+                                    InitProducer::Completed(ProducerIdResponse {
+                                        id: -1,
+                                        epoch: -1,
+                                        error: ErrorCode::UnknownServerError,
+                                    }),
+                                    None,
+                                ),
                             }
                         }
-                    }
+                    },
 
                     (producer, epoch) => {
                         error!(?producer, ?epoch);
@@ -2098,10 +2094,7 @@ impl Storage for Engine {
 
                 match (producer_id, producer_epoch) {
                     (Some(-1), Some(-1)) => {
-                        let producer = coord
-                            .producers
-                            .last_key_value()
-                            .map_or(1, |(k, _v)| k + 1);
+                        let producer = coord.producers.last_key_value().map_or(1, |(k, _v)| k + 1);
 
                         let epoch = 0;
                         let mut pd = ProducerDetail::default();
@@ -2166,8 +2159,7 @@ impl Storage for Engine {
                     let mut coord = self.coord.lock().await;
 
                     let txn_detail =
-                        match coord.txn_detail_mut(&transaction_id, producer_id, producer_epoch)
-                        {
+                        match coord.txn_detail_mut(&transaction_id, producer_id, producer_epoch) {
                             Ok(txn_detail) => txn_detail,
                             Err(Error::Api(error_code)) => {
                                 return Ok(Self::txn_add_partitions_response(topics, error_code));
@@ -2330,8 +2322,7 @@ impl Storage for Engine {
         ) = {
             let mut coord = self.coord.lock().await;
 
-            let txn_detail =
-                coord.txn_detail_mut(transaction_id, producer_id, producer_epoch)?;
+            let txn_detail = coord.txn_detail_mut(transaction_id, producer_id, producer_epoch)?;
 
             let mut produced = vec![];
             let mut prepared_ranges = vec![];
@@ -2411,7 +2402,13 @@ impl Storage for Engine {
                 coord.overlapping_transactions(transaction_id, producer_id, producer_epoch);
 
             if !overlaps.iter().all(|txn| txn.state.is_prepared()) {
-                debug!(transaction_id, producer_id, producer_epoch, ?overlaps, "deferred");
+                debug!(
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    ?overlaps,
+                    "deferred"
+                );
                 return Ok(ErrorCode::None);
             }
 
@@ -2457,9 +2454,7 @@ impl Storage for Engine {
                     .iter()
                     .flat_map(|(topic, partitions)| {
                         partitions.iter().filter_map(|(partition, range)| {
-                            range.map(|range| {
-                                (Topition::new(topic.to_owned(), *partition), range)
-                            })
+                            range.map(|range| (Topition::new(topic.to_owned(), *partition), range))
                         })
                     })
                     .collect();
@@ -2655,7 +2650,10 @@ impl Storage for Engine {
                 .txn_end(&transaction_id, producer_id, producer_epoch, false)
                 .await
             {
-                error!(?err, transaction_id, producer_id, producer_epoch, "sweep abort failed");
+                error!(
+                    ?err,
+                    transaction_id, producer_id, producer_epoch, "sweep abort failed"
+                );
             }
         }
 
@@ -2788,7 +2786,9 @@ mod tests {
 
                 assert_eq!(
                     ErrorCode::None,
-                    engine.txn_end("txn-a", txn.id, txn.epoch, committed).await?
+                    engine
+                        .txn_end("txn-a", txn.id, txn.epoch, committed)
+                        .await?
                 );
             }
 
@@ -2827,7 +2827,10 @@ mod tests {
         assert_eq!(7, batches.len());
         assert_eq!(
             (0..7).collect::<Vec<i64>>(),
-            batches.iter().map(|batch| batch.base_offset).collect::<Vec<_>>()
+            batches
+                .iter()
+                .map(|batch| batch.base_offset)
+                .collect::<Vec<_>>()
         );
 
         let aborted = engine.aborted_transactions(&topition, 0).await?;
@@ -2835,7 +2838,11 @@ mod tests {
         assert_eq!(5, aborted[0].first_offset); // 3 plain + txn(3) + marker(4)
 
         let offsets = engine
-            .offset_fetch(Some("group-a"), std::slice::from_ref(&topition), Some(false))
+            .offset_fetch(
+                Some("group-a"),
+                std::slice::from_ref(&topition),
+                Some(false),
+            )
             .await?;
         assert_eq!(Some(&2), offsets.get(&topition));
 
@@ -2936,9 +2943,11 @@ mod tests {
         _ = engine
             .create_topic(
                 topic("retained", 1).configs(Some(
-                    [tansu_sans_io::create_topics_request::CreatableTopicConfig::default()
-                        .name("retention.ms".into())
-                        .value(Some("1000".into()))]
+                    [
+                        tansu_sans_io::create_topics_request::CreatableTopicConfig::default()
+                            .name("retention.ms".into())
+                            .value(Some("1000".into())),
+                    ]
                     .into(),
                 )),
                 false,
@@ -3014,8 +3023,7 @@ mod tests {
                 let mut offsets = vec![];
 
                 for i in 0..EACH {
-                    let batch = batch(-1, -1, -1, false, &format!("t{task}-{i}"))
-                        .expect("batch");
+                    let batch = batch(-1, -1, -1, false, &format!("t{task}-{i}")).expect("batch");
                     offsets.push(
                         engine
                             .produce(None, &topition, batch)
@@ -3139,7 +3147,11 @@ mod tests {
         // And the log continues past the recovered watermark.
         let pid = engine.init_producer(None, 0, Some(-1), Some(-1)).await?;
         let offset = engine
-            .produce(None, &topition, batch(pid.id, pid.epoch, 0, false, "after")?)
+            .produce(
+                None,
+                &topition,
+                batch(pid.id, pid.epoch, 0, false, "after")?,
+            )
             .await?;
         assert_eq!(stage.high_watermark(), offset);
 
@@ -3245,9 +3257,11 @@ mod tests {
         _ = engine
             .create_topic(
                 topic("budget", 1).configs(Some(
-                    [tansu_sans_io::create_topics_request::CreatableTopicConfig::default()
-                        .name("retention.ms".into())
-                        .value(Some("1000".into()))]
+                    [
+                        tansu_sans_io::create_topics_request::CreatableTopicConfig::default()
+                            .name("retention.ms".into())
+                            .value(Some("1000".into())),
+                    ]
                     .into(),
                 )),
                 false,

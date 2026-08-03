@@ -236,8 +236,7 @@ impl SnapshotDoc {
             for (epoch, topics) in &producer.sequences {
                 let mut by_topic = BTreeMap::new();
                 for (topic, partitions) in topics {
-                    _ = by_topic
-                        .insert(topic.clone(), partitions.iter().copied().collect());
+                    _ = by_topic.insert(topic.clone(), partitions.iter().copied().collect());
                 }
                 _ = detail.sequences.insert(*epoch, by_topic);
             }
@@ -251,16 +250,14 @@ impl SnapshotDoc {
             for (epoch, snap) in &txn.epochs {
                 let mut produces = BTreeMap::new();
                 for (topic, partitions) in &snap.produces {
-                    _ = produces
-                        .insert(topic.clone(), partitions.iter().copied().collect());
+                    _ = produces.insert(topic.clone(), partitions.iter().copied().collect());
                 }
 
                 let mut offsets = BTreeMap::new();
                 for (group, topics) in &snap.offsets {
                     let mut by_topic = BTreeMap::new();
                     for (topic, partitions) in topics {
-                        _ = by_topic
-                            .insert(topic.clone(), partitions.iter().cloned().collect());
+                        _ = by_topic.insert(topic.clone(), partitions.iter().cloned().collect());
                     }
                     _ = offsets.insert(group.clone(), by_topic);
                 }
@@ -342,8 +339,8 @@ pub(crate) fn load_latest(dir: &Path) -> Result<Option<SnapshotDoc>> {
         return Ok(None);
     }
 
-    for entry in std::fs::read_dir(dir)
-        .map_err(|err| Error::Message(format!("nvme snapshot dir: {err}")))?
+    for entry in
+        std::fs::read_dir(dir).map_err(|err| Error::Message(format!("nvme snapshot dir: {err}")))?
     {
         let entry = entry.map_err(|err| Error::Message(format!("nvme snapshot dir: {err}")))?;
         let name = entry.file_name();
@@ -389,8 +386,8 @@ pub(crate) fn load_latest(dir: &Path) -> Result<Option<SnapshotDoc>> {
 pub(crate) fn prune(dir: &Path) -> Result<()> {
     let mut paths: Vec<(u64, PathBuf)> = vec![];
 
-    for entry in std::fs::read_dir(dir)
-        .map_err(|err| Error::Message(format!("nvme snapshot dir: {err}")))?
+    for entry in
+        std::fs::read_dir(dir).map_err(|err| Error::Message(format!("nvme snapshot dir: {err}")))?
     {
         let entry = entry.map_err(|err| Error::Message(format!("nvme snapshot dir: {err}")))?;
         let name = entry.file_name();

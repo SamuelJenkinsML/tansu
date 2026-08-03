@@ -126,9 +126,7 @@ struct Meta {
     aborted: BTreeMap<Topic, BTreeMap<Partition, Vec<AbortedTxnRange>>>,
 }
 
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct AbortedTxnRange {
     producer: ProducerId,
     offset_start: Offset,
@@ -674,7 +672,10 @@ impl Storage for DynoStore {
                     let watermark = self.watermarks.lock().map(|mut locked| {
                         locked
                             .entry(topition.to_owned())
-                            .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), &topition).local(self.local))
+                            .or_insert(
+                                OptiCon::<Watermark>::new(self.cluster.as_str(), &topition)
+                                    .local(self.local),
+                            )
                             .to_owned()
                     })?;
 
@@ -828,7 +829,9 @@ impl Storage for DynoStore {
             let watermark = self.watermarks.lock().map(|mut locked| {
                 locked
                     .entry(topition.to_owned())
-                    .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition).local(self.local))
+                    .or_insert_with(|| {
+                        OptiCon::<Watermark>::new(self.cluster.as_str(), topition).local(self.local)
+                    })
                     .to_owned()
             })?;
 
@@ -961,7 +964,9 @@ impl Storage for DynoStore {
             let watermark = self.watermarks.lock().map(|mut locked| {
                 locked
                     .entry(topition.to_owned())
-                    .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition).local(self.local))
+                    .or_insert_with(|| {
+                        OptiCon::<Watermark>::new(self.cluster.as_str(), topition).local(self.local)
+                    })
                     .to_owned()
             })?;
 
@@ -1243,7 +1248,9 @@ impl Storage for DynoStore {
         let watermark = self.watermarks.lock().map(|mut locked| {
             locked
                 .entry(topition.to_owned())
-                .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), topition).local(self.local))
+                .or_insert(
+                    OptiCon::<Watermark>::new(self.cluster.as_str(), topition).local(self.local),
+                )
                 .to_owned()
         })?;
 
@@ -2405,12 +2412,9 @@ impl Storage for DynoStore {
                         // leak its previous incarnation's payload into the new
                         // one. Aborted ranges already moved to `meta.aborted`
                         // at txn_end; this also scrubs any pre-fix state.
-                        if txn_detail
-                            .state
-                            .is_some_and(|state| {
-                                matches!(state, TxnState::Committed | TxnState::Aborted)
-                            })
-                        {
+                        if txn_detail.state.is_some_and(|state| {
+                            matches!(state, TxnState::Committed | TxnState::Aborted)
+                        }) {
                             txn_detail.produces.clear();
                             txn_detail.offsets.clear();
                         }

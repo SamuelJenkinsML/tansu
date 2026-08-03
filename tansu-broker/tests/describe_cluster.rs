@@ -255,14 +255,7 @@ mod nvme {
         node: i32,
         advertised_listener: Url,
     ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::Nvme,
-            cluster,
-            node,
-            advertised_listener,
-            None,
-        )
-        .await
+        common::storage_container(StorageType::Nvme, cluster, node, advertised_listener, None).await
     }
 
     #[tokio::test]

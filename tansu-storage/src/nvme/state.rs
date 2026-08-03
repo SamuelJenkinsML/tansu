@@ -18,10 +18,7 @@
 //! coordination mutex; durability comes from the metadata WAL + snapshots
 //! (both replayed at boot), never from rewriting this state to disk inline.
 
-use std::{
-    collections::BTreeMap,
-    time::SystemTime,
-};
+use std::{collections::BTreeMap, time::SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tansu_sans_io::{
@@ -118,7 +115,9 @@ impl CoordState {
         producer_epoch: ProducerEpoch,
     ) -> Result<&mut TxnDetail> {
         let Some(transaction) = self.transactions.get_mut(transaction_id) else {
-            return Err(Error::Api(tansu_sans_io::ErrorCode::TransactionalIdNotFound));
+            return Err(Error::Api(
+                tansu_sans_io::ErrorCode::TransactionalIdNotFound,
+            ));
         };
 
         if transaction.producer != producer_id {
@@ -297,8 +296,7 @@ impl CoordState {
                             continue;
                         };
 
-                        if let Some(candidate) =
-                            candidates.get(&(topic.clone(), *partition))
+                        if let Some(candidate) = candidates.get(&(topic.clone(), *partition))
                             && offset_range.offset_start < candidate.offset_end
                         {
                             overlapping.push(TxnRef {
@@ -370,14 +368,17 @@ impl CoordState {
                 }
             }
 
-            _ = metadata.topic.configs.replace(
-                configuration
-                    .into_iter()
-                    .fold(Vec::new(), |mut acc, (key, value)| {
-                        acc.push(CreatableTopicConfig::default().name(key).value(value));
-                        acc
-                    }),
-            );
+            _ = metadata
+                .topic
+                .configs
+                .replace(
+                    configuration
+                        .into_iter()
+                        .fold(Vec::new(), |mut acc, (key, value)| {
+                            acc.push(CreatableTopicConfig::default().name(key).value(value));
+                            acc
+                        }),
+                );
         }
 
         Ok(())
