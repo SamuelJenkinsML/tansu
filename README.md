@@ -1,3 +1,8 @@
+> **This is a fork.** Maintained for the [Thyme](https://github.com/SamuelJenkinsML/thyme)
+> feature platform; upstream is [tansu-io/tansu](https://github.com/tansu-io/tansu).
+> Adds an `nvme://` storage engine and exactly-once fixes, and **disables upstream's
+> CI workflows** — see [FORK.md](FORK.md) before re-enabling anything.
+
 <div align="center">
 
 # Tansu 🗃️

@@ -1,0 +1,66 @@
+---
+# Lean gate for the Thyme fork.
+#
+# Upstream's ci.yml is 38 jobs (~410 billed minutes per run): a postgres
+# 16/17/18 test matrix, build-storage-lake at 5 storage x 3 lake, and the
+# librdkafka/franz-go compat suites across every backend -- with `cache: false`
+# on every job. It is disabled on this fork (`gh workflow disable ci.yml`)
+# rather than edited, so upstream rebases stay conflict-free and the file
+# remains valid for PRs we send upstream.
+#
+# This gate covers what the fork actually owns: the nvme:// storage engine and
+# the EOS aborted-transaction index. Scoped to default features -- NOT
+# --all-features, which drags in delta/iceberg/parquet and their datafusion and
+# arrow trees for lake support this fork does not use.
+#
+# The heavier suites still exist and are run deliberately rather than on every
+# push: `just test` locally, and the librdkafka/franz-go compat harnesses once
+# in-cluster against real instance-store NVMe as a release gate (TH-235).
+name: fork-ci
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CLICOLOR: 1
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # setup-rust-toolchain caches by default; upstream disables it, which is
+      # most of why their jobs are so slow. rust-toolchain.toml pins 1.95.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libkrb5-dev
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - uses: taiki-e/install-action@nextest
+
+      # 61 tests: the nvme unit + frame property tests in tansu-storage, and
+      # the nvme arm of every tansu-broker conformance suite (txn.rs included,
+      # which is where the aborted-index and abort-path regressions would show).
+      # The tiering tests are #[ignore]d behind AWS_* and stay out of CI -- they
+      # need a real object store, so they run in-cluster against S3 instead.
+      - name: Test (nvme)
+        run: cargo nextest run -p tansu-storage -p tansu-broker -E 'test(nvme)' --no-fail-fast
