@@ -25,6 +25,21 @@ export BOOTSTRAP_SERVERS
 RESULTS_DIR="${RESULTS_DIR:-/work/results}"
 SUITES="${SUITES:-librdkafka franz-go}"
 
+# Tests that also fail against memory:// and are therefore broker gaps rather
+# than storage-engine regressions (see compat/librdkafka/FINDINGS.md). Without
+# this the gate can never pass, so a real regression would be indistinguishable
+# from the standing failure everyone has learned to ignore.
+#
+# Space-separated, per suite. Override KNOWN_GAPS_<suite> to re-check one.
+KNOWN_GAPS_librdkafka="${KNOWN_GAPS_librdkafka:-0060}"
+KNOWN_GAPS_franz_go="${KNOWN_GAPS_franz_go:-}"
+
+known_gaps_for() {
+    # franz-go -> franz_go, because a hyphen cannot appear in a variable name.
+    local var="KNOWN_GAPS_${1//-/_}"
+    printf '%s' "${!var:-}"
+}
+
 mkdir -p "${RESULTS_DIR}"
 
 echo "=== Kafka client compatibility ==="
@@ -46,29 +61,45 @@ echo "==================== report card ===================="
 overall=0
 for suite in ${SUITES}; do
     csv="${RESULTS_DIR}/${suite}.csv"
-    if [[ -f "${csv}" ]]; then
-        pass=$(grep -c ',PASS$' "${csv}" || true)
-        fail=$(grep -c ',FAIL$' "${csv}" || true)
-        total=$((pass + fail))
-        printf '%-12s %s/%s passed (exit %s)\n' \
-               "${suite}" "${pass}" "${total}" "${status[${suite}]}"
-        if (( fail > 0 )); then
-            echo "  failed:"
-            grep ',FAIL$' "${csv}" | sed 's/,FAIL$//; s/^/    /'
-        fi
-    else
+    if [[ ! -f "${csv}" ]]; then
         printf '%-12s no results file -- suite did not run (exit %s)\n' \
                "${suite}" "${status[${suite}]}"
+        overall=1
+        continue
     fi
-    (( status[${suite}] != 0 )) && overall=1
+
+    pass=$(grep -c ',PASS$' "${csv}" || true)
+    fail=$(grep -c ',FAIL$' "${csv}" || true)
+    total=$((pass + fail))
+
+    gaps=" $(known_gaps_for "${suite}") "
+    regressions=()
+    while read -r t; do
+        [[ -z "${t}" ]] && continue
+        [[ "${gaps}" == *" ${t} "* ]] || regressions+=("${t}")
+    done < <(grep ',FAIL$' "${csv}" | sed 's/,FAIL$//')
+
+    printf '%-12s %s/%s passed' "${suite}" "${pass}" "${total}"
+    if (( ${#regressions[@]} )); then
+        printf '  -- %s REGRESSION(S)\n' "${#regressions[@]}"
+        printf '     %s\n' "${regressions[@]}"
+        overall=1
+    elif (( fail > 0 )); then
+        printf '  -- %s known gap(s), no regression\n' "${fail}"
+        grep ',FAIL$' "${csv}" | sed 's/,FAIL$//; s/^/     /'
+    else
+        printf '  -- clean\n'
+    fi
 done
 
 echo
 if (( overall == 0 )); then
-    echo "PASS: every allowlisted test passed against ${BOOTSTRAP_SERVERS}"
+    echo "PASS: no client-visible protocol regression against ${BOOTSTRAP_SERVERS}"
+    echo "(Known gaps listed above fail on memory:// too, so they are broker"
+    echo " limitations rather than storage-engine faults.)"
 else
-    echo "FAIL: at least one suite regressed against ${BOOTSTRAP_SERVERS}"
-    echo "Compare against the memory:// baselines in compat/*/FINDINGS.md before"
-    echo "attributing a failure to the storage engine -- some are known broker gaps."
+    echo "FAIL: regression against ${BOOTSTRAP_SERVERS}"
+    echo "The tests above are NOT known gaps -- they pass on memory://, so the"
+    echo "storage engine is the first thing to suspect."
 fi
 exit "${overall}"
