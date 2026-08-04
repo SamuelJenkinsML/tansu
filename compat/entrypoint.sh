@@ -14,7 +14,12 @@
 # Kubernetes Job gate.
 set -uo pipefail
 
-: "${BOOTSTRAP_SERVERS:?set BOOTSTRAP_SERVERS to the broker's host:port}"
+# No apostrophe in this message: inside ${var:?word} the word still undergoes
+# quote processing even within double quotes, so a lone ' opens a single-quoted
+# string that never closes and bash fails the whole script at parse time with
+# "unexpected EOF while looking for matching `''" pointing at a line 38 lines
+# further down.
+: "${BOOTSTRAP_SERVERS:?set BOOTSTRAP_SERVERS to the broker host:port}"
 export BOOTSTRAP_SERVERS
 
 RESULTS_DIR="${RESULTS_DIR:-/work/results}"

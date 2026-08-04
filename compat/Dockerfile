@@ -72,6 +72,9 @@ RUN git clone --depth 1 --branch "${FRANZ_GO_VERSION}" \
 COPY compat/ /work/compat/
 
 COPY compat/entrypoint.sh /usr/local/bin/run-compat
-RUN chmod +x /usr/local/bin/run-compat
+# Parse-check at build time. The script only runs at the end of a multi-minute
+# Job against a live broker, so a syntax error otherwise surfaces as a wasted
+# run -- which is exactly how the ${var:?...} apostrophe bug above was found.
+RUN chmod +x /usr/local/bin/run-compat && bash -n /usr/local/bin/run-compat
 
 ENTRYPOINT ["/usr/local/bin/run-compat"]
