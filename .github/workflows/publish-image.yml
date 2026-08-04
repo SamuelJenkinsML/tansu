@@ -77,3 +77,52 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "TANSU_IMAGE=${IMAGE}:git-${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Kafka client-compatibility suites (librdkafka + franz-go), packaged to run
+  # as a Job against a deployed broker (TH-235).
+  #
+  # Separate job, not a second step: it shares nothing with the broker build
+  # (different base image, different toolchains) so serialising them would only
+  # add wall-clock. It is deliberately NOT a dependency of the broker publish --
+  # a compat-image build failure must not block shipping the broker.
+  #
+  # The suites are compiled at image-build time, so this is slow (~15 min: a C
+  # configure+make and a Go build) and rarely needs to change. It is therefore
+  # gated to workflow_dispatch rather than running on every push to main; the
+  # image only needs rebuilding when compat/ or the pinned client versions move.
+  # ---------------------------------------------------------------------------
+  publish-compat:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        env:
+          IMAGE: ${{ steps.ecr-login.outputs.registry }}/thyme/tansu-compat
+        with:
+          context: .
+          file: compat/Dockerfile
+          push: true
+          platforms: linux/arm64
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:git-${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-arm64
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-arm64,mode=max,image-manifest=true,oci-mediatypes=true
