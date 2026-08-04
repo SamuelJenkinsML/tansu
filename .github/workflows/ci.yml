@@ -131,6 +131,7 @@ jobs:
         storage:
           - dynostore
           - libsql
+          - nvme
           - postgres
           - slatedb
     steps:
@@ -151,6 +152,7 @@ jobs:
         storage:
           - dynostore
           - libsql
+          - nvme
           - postgres
           - slatedb
         lake:
@@ -186,6 +188,9 @@ jobs:
           - name: sqlite
             engine: sqlite://tansu.db
             features: libsql
+          - name: nvme
+            engine: nvme:///tmp/tansu-nvme
+            features: nvme
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -261,6 +266,9 @@ jobs:
           - name: sqlite
             engine: sqlite://tansu.db
             features: libsql
+          - name: nvme
+            engine: nvme:///tmp/tansu-nvme
+            features: nvme
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin

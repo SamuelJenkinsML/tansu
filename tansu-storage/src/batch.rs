@@ -448,6 +448,16 @@ where
         self.storage.offset_stage(topition).await
     }
 
+    async fn aborted_transactions(
+        &self,
+        topition: &Topition,
+        fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        self.storage
+            .aborted_transactions(topition, fetch_offset)
+            .await
+    }
+
     async fn list_offsets(
         &self,
         isolation_level: IsolationLevel,
@@ -808,6 +818,14 @@ mod tests {
         }
 
         async fn offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
+            unimplemented!()
+        }
+
+        async fn aborted_transactions(
+            &self,
+            _topition: &Topition,
+            _fetch_offset: i64,
+        ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
             unimplemented!()
         }
 

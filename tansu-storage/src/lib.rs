@@ -249,6 +249,9 @@ mod os;
 #[cfg(feature = "turso")]
 mod limbo;
 
+#[cfg(feature = "nvme")]
+pub mod nvme;
+
 /// Storage Errors
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
@@ -1387,6 +1390,14 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Query the offset stage for a topic partition.
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage>;
 
+    /// Aborted transactions whose records overlap `fetch_offset` for a topic
+    /// partition, so `read_committed` consumers can skip aborted records.
+    async fn aborted_transactions(
+        &self,
+        topition: &Topition,
+        fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>>;
+
     /// Query the offsets for one or more topic partitions.
     async fn list_offsets(
         &self,
@@ -1593,6 +1604,16 @@ where
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         self.as_ref().offset_stage(topition).await
+    }
+
+    async fn aborted_transactions(
+        &self,
+        topition: &Topition,
+        fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        self.as_ref()
+            .aborted_transactions(topition, fetch_offset)
+            .await
     }
 
     async fn list_offsets(
@@ -1852,6 +1873,16 @@ where
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         self.as_ref().offset_stage(topition).await
+    }
+
+    async fn aborted_transactions(
+        &self,
+        topition: &Topition,
+        fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        self.as_ref()
+            .aborted_transactions(topition, fetch_offset)
+            .await
     }
 
     async fn list_offsets(
@@ -2407,6 +2438,67 @@ impl Builder<i32, String, Url, Url> {
             .map(|storage| Box::new(storage) as Box<dyn Storage>)
             .map(Arc::new),
 
+            // Local-filesystem object store: the low-latency, local-durable
+            // "freshness tier" — same dynostore code path as s3://, backed by
+            // local NVMe instead of a remote object store.
+            #[cfg(feature = "dynostore")]
+            "file" => {
+                let path = self.storage.path();
+                std::fs::create_dir_all(path)?;
+                object_store::local::LocalFileSystem::new_with_prefix(path)
+                    .map(|object_store| {
+                        DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
+                            .local(true)
+                            .advertised_listener(self.advertised_listener.clone())
+                            .schemas(self.schema_registry)
+                            .lake(self.lake_house.clone())
+                    })
+                    .map(|storage| Box::new(storage) as Box<dyn Storage>)
+                    .map(Arc::new)
+                    .map_err(Into::into)
+            }
+
+            #[cfg(not(feature = "dynostore"))]
+            "file" => Err(Error::FeatureNotEnabled {
+                feature: "dynostore".into(),
+                message: self.storage.to_string(),
+            }),
+
+            // Local-NVMe append-log engine: per-partition segment logs +
+            // in-memory coordination state + metadata WAL with group-commit
+            // fsync. Unlike file:// (dynostore over LocalFileSystem) this is
+            // a purpose-built local engine with no global coordination object.
+            #[cfg(feature = "nvme")]
+            "nvme" => {
+                if self.lake_house.is_some() {
+                    Err(Error::Message(
+                        "nvme:// does not support a lake house sink; use another engine for tansu.lake.sink".into(),
+                    ))
+                } else {
+                    let path = self.storage.path();
+                    std::fs::create_dir_all(path)?;
+                    let config = nvme::Config::from_url(&self.storage)?;
+
+                    nvme::Engine::open(
+                        self.cluster_id.as_str(),
+                        self.node_id,
+                        path,
+                        self.advertised_listener.clone(),
+                        self.schema_registry,
+                        config,
+                    )
+                    .await
+                    .map(|storage| Box::new(storage) as Box<dyn Storage>)
+                    .map(Arc::new)
+                }
+            }
+
+            #[cfg(not(feature = "nvme"))]
+            "nvme" => Err(Error::FeatureNotEnabled {
+                feature: "nvme".into(),
+                message: self.storage.to_string(),
+            }),
+
             #[cfg(not(feature = "dynostore"))]
             "s3" | "memory" => Err(Error::FeatureNotEnabled {
                 feature: "dynostore".into(),
@@ -2515,6 +2607,7 @@ impl Builder<i32, String, Url, Url> {
             #[cfg(not(any(
                 feature = "dynostore",
                 feature = "libsql",
+                feature = "nvme",
                 feature = "postgres",
                 feature = "slatedb",
                 feature = "turso"
@@ -2530,6 +2623,7 @@ impl Builder<i32, String, Url, Url> {
             #[cfg(any(
                 feature = "dynostore",
                 feature = "libsql",
+                feature = "nvme",
                 feature = "postgres",
                 feature = "slatedb",
                 feature = "turso"
@@ -2896,6 +2990,41 @@ impl Storage for StorageContainer {
 
             #[cfg(feature = "turso")]
             Self::Turso(engine) => engine.offset_stage(topition),
+        }
+        .await
+        .inspect(|_| {
+            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
+        })
+        .inspect_err(|_| {
+            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
+        })
+    }
+
+    #[instrument(skip_all)]
+    async fn aborted_transactions(
+        &self,
+        topition: &Topition,
+        fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        let attributes = [KeyValue::new("method", "aborted_transactions")];
+
+        match self {
+            #[cfg(feature = "dynostore")]
+            Self::DynoStore(engine) => engine.aborted_transactions(topition, fetch_offset),
+
+            #[cfg(feature = "libsql")]
+            Self::Lite(engine) => engine.aborted_transactions(topition, fetch_offset),
+
+            Self::Null(engine) => engine.aborted_transactions(topition, fetch_offset),
+
+            #[cfg(feature = "postgres")]
+            Self::Postgres(engine) => engine.aborted_transactions(topition, fetch_offset),
+
+            #[cfg(feature = "slatedb")]
+            Self::Slate(engine) => engine.aborted_transactions(topition, fetch_offset),
+
+            #[cfg(feature = "turso")]
+            Self::Turso(engine) => engine.aborted_transactions(topition, fetch_offset),
         }
         .await
         .inspect(|_| {

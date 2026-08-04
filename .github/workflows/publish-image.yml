@@ -1,0 +1,79 @@
+---
+# Build and push the fork's broker image to Thyme's ECR.
+#
+# Trigger is `push` to main only -- never `pull_request`. This repository is
+# public, so that is what keeps a PR from an external fork from ever reaching
+# the OIDC role. The trust policy in thyme-infra
+# (terraform/modules/ci_build) is scoped to `repo:<repo>:ref:refs/heads/main`,
+# which this satisfies without widening.
+#
+# arm64 only: Thyme's demo cluster is Graviton throughout, so a multi-arch
+# manifest would be half wasted build time. Running on a native arm64 runner
+# also avoids QEMU-emulating a workspace built with codegen-units = 1 and thin
+# LTO, which is the difference between minutes and an hour.
+#
+# The repo Dockerfile cross-builds a static musl binary with --all-features, so
+# nvme:// is included. Consumers pin the git-<sha> tag: a benchmark result that
+# cannot name the exact image it ran is not reproducible (TH-235).
+name: publish-image
+
+permissions:
+  contents: read
+  id-token: write
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: publish-image
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-1
+  IMAGE_NAME: thyme/tansu
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        env:
+          IMAGE: ${{ steps.ecr-login.outputs.registry }}/${{ env.IMAGE_NAME }}
+        with:
+          context: .
+          push: true
+          platforms: linux/arm64
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:git-${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-arm64
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-arm64,mode=max,image-manifest=true,oci-mediatypes=true
+
+      - name: Report pinned tag
+        env:
+          IMAGE: ${{ steps.ecr-login.outputs.registry }}/${{ env.IMAGE_NAME }}
+        run: |
+          echo "### Broker image published" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "TANSU_IMAGE=${IMAGE}:git-${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

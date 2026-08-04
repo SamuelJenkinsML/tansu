@@ -33,7 +33,7 @@ use tansu_sans_io::{
 };
 use tansu_schema::Registry;
 use tansu_storage::{BrokerRegistrationRequest, Storage, StorageContainer};
-use tokio::fs::remove_file;
+use tokio::fs::{remove_dir_all, remove_file};
 use tracing::{debug, subscriber::DefaultGuard};
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -72,6 +72,7 @@ pub(crate) fn init_tracing() -> Result<DefaultGuard> {
 pub(crate) enum StorageType {
     InMemory,
     Lite,
+    Nvme,
     Postgres,
     SlateDb,
     Turso,
@@ -199,6 +200,39 @@ pub(crate) async fn storage_container(
                         .inspect(|url| debug!(url))
                         .and_then(|url| Url::parse(&url).map_err(Into::into))?,
                 )
+                .build()
+                .await
+        }
+
+        // Per-thread data dir under ../logs, wiped before each test.
+        StorageType::Nvme => {
+            let relative = thread::current()
+                .name()
+                .ok_or(Error::Message(String::from("unnamed thread")))
+                .map(|name| {
+                    format!(
+                        "../logs/{}/{}::{name}.nvme",
+                        env!("CARGO_PKG_NAME"),
+                        env!("CARGO_CRATE_NAME")
+                    )
+                })?;
+
+            let mut path = env::current_dir()?;
+            path.push(relative);
+            debug!(?path);
+
+            match remove_dir_all(&path).await {
+                Ok(_) => Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                otherwise @ Err(_) => otherwise,
+            }?;
+
+            StorageContainer::builder()
+                .cluster_id(cluster.clone())
+                .node_id(node)
+                .advertised_listener(advertised_listener)
+                .schema_registry(schemas)
+                .storage(Url::parse(&format!("nvme://{}", path.display()))?)
                 .build()
                 .await
         }

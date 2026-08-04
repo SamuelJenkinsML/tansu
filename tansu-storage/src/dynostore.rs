@@ -96,6 +96,11 @@ pub struct DynoStore {
     lake: Option<House>,
     watermarks: Arc<Mutex<BTreeMap<Topition, OptiCon<Watermark>>>>,
     meta: OptiCon<Meta>,
+    // Single-node local backend (file://): serialize OptiCon writes in-process
+    // and overwrite unconditionally (LocalFileSystem has no conditional put).
+    local: bool,
+    // Serializes the `put` helper's writes in local mode (no conditional put).
+    put_serialize: Arc<tokio::sync::Mutex<()>>,
 
     object_store: Arc<DynObjectStore>,
 }
@@ -113,6 +118,19 @@ struct Meta {
     producers: BTreeMap<ProducerId, ProducerDetail>,
     topics: BTreeMap<Topic, TopicMetadata>,
     transactions: BTreeMap<String, Txn>,
+    // Aborted-transaction ranges per topic/partition, decoupled from the
+    // producing txn's lifecycle: classic clients re-begin at the same
+    // (txn id, epoch), resetting that txn's `produces`, so the
+    // read_committed aborted index cannot live inside the txn detail.
+    #[serde(default)]
+    aborted: BTreeMap<Topic, BTreeMap<Partition, Vec<AbortedTxnRange>>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+struct AbortedTxnRange {
+    producer: ProducerId,
+    offset_start: Offset,
+    offset_end: Offset,
 }
 
 impl OptiCon<Meta> {
@@ -178,6 +196,14 @@ impl Meta {
                 let Some(state) = txn_detail.state else {
                     continue;
                 };
+
+                // Terminal transactions can never become prepared again:
+                // counting them here would deadlock the all(is_prepared)
+                // resolution gate in txn_end, pinning the LSO forever after
+                // any abort on the partition.
+                if matches!(state, TxnState::Committed | TxnState::Aborted) {
+                    continue;
+                }
 
                 for (topic, partitions) in txn_detail.produces.iter() {
                     for (partition, offset_range) in partitions.iter() {
@@ -380,6 +406,8 @@ impl DynoStore {
 
             watermarks: Arc::new(Mutex::new(BTreeMap::new())),
             meta: OptiCon::<Meta>::new(cluster),
+            local: false,
+            put_serialize: Default::default(),
             object_store: Arc::new(Cache::new(
                 Metron::new(object_store, cluster),
                 Duration::from_millis(5_000),
@@ -390,6 +418,16 @@ impl DynoStore {
     pub fn advertised_listener(self, advertised_listener: Url) -> Self {
         Self {
             advertised_listener,
+            ..self
+        }
+    }
+
+    /// Single-node local backend: serialize OptiCon writes in-process and
+    /// overwrite unconditionally (for object stores without conditional put).
+    pub fn local(self, local: bool) -> Self {
+        Self {
+            local,
+            meta: self.meta.local(local),
             ..self
         }
     }
@@ -459,6 +497,27 @@ impl DynoStore {
         V: PartialEq + Serialize + DeserializeOwned + Debug,
     {
         debug!(%location, ?attributes, ?update_version, ?value);
+
+        // Local backend: LocalFileSystem has neither conditional put nor custom
+        // attributes. Single-node → serialize in-process + overwrite; drop attrs.
+        if self.local {
+            let _serialize = self.put_serialize.lock().await;
+            let payload = serde_json::to_vec(&value)
+                .map(Bytes::from)
+                .map(PutPayload::from)?;
+            return self
+                .object_store
+                .put_opts(
+                    location,
+                    payload,
+                    PutOptions {
+                        mode: PutMode::Overwrite,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(Into::into);
+        }
 
         let options = PutOptions {
             mode: update_version.map_or(PutMode::Create, PutMode::Update),
@@ -613,7 +672,10 @@ impl Storage for DynoStore {
                     let watermark = self.watermarks.lock().map(|mut locked| {
                         locked
                             .entry(topition.to_owned())
-                            .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), &topition))
+                            .or_insert(
+                                OptiCon::<Watermark>::new(self.cluster.as_str(), &topition)
+                                    .local(self.local),
+                            )
                             .to_owned()
                     })?;
 
@@ -646,6 +708,7 @@ impl Storage for DynoStore {
             self.meta
                 .with_mut(&self.object_store, |meta| {
                     _ = meta.topics.remove(metadata.topic.name.as_str());
+                    _ = meta.aborted.remove(metadata.topic.name.as_str());
                     Ok(())
                 })
                 .await?;
@@ -766,7 +829,9 @@ impl Storage for DynoStore {
             let watermark = self.watermarks.lock().map(|mut locked| {
                 locked
                     .entry(topition.to_owned())
-                    .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
+                    .or_insert_with(|| {
+                        OptiCon::<Watermark>::new(self.cluster.as_str(), topition).local(self.local)
+                    })
                     .to_owned()
             })?;
 
@@ -899,7 +964,9 @@ impl Storage for DynoStore {
             let watermark = self.watermarks.lock().map(|mut locked| {
                 locked
                     .entry(topition.to_owned())
-                    .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
+                    .or_insert_with(|| {
+                        OptiCon::<Watermark>::new(self.cluster.as_str(), topition).local(self.local)
+                    })
                     .to_owned()
             })?;
 
@@ -1181,7 +1248,9 @@ impl Storage for DynoStore {
         let watermark = self.watermarks.lock().map(|mut locked| {
             locked
                 .entry(topition.to_owned())
-                .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
+                .or_insert(
+                    OptiCon::<Watermark>::new(self.cluster.as_str(), topition).local(self.local),
+                )
                 .to_owned()
         })?;
 
@@ -1197,6 +1266,38 @@ impl Storage for DynoStore {
                     high_watermark,
                     log_start,
                 })
+            })
+            .await
+    }
+
+    async fn aborted_transactions(
+        &self,
+        topition: &Topition,
+        fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        self.meta
+            .with(&self.object_store, move |meta| {
+                let mut aborted: Vec<_> = meta
+                    .aborted
+                    .get(topition.topic())
+                    .and_then(|partitions| partitions.get(&topition.partition()))
+                    .map(|ranges| {
+                        ranges
+                            .iter()
+                            // Only report txns whose records overlap the fetch range.
+                            .filter(|range| range.offset_end >= fetch_offset)
+                            .map(|range| {
+                                tansu_sans_io::fetch_response::AbortedTransaction::default()
+                                    .producer_id(range.producer)
+                                    .first_offset(range.offset_start)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                // read_committed clients expect ascending first_offset order.
+                aborted.sort_by_key(|aborted| aborted.first_offset);
+                Ok(aborted)
             })
             .await
     }
@@ -1380,7 +1481,12 @@ impl Storage for DynoStore {
 
                 let options = PutOptions {
                     mode: PutMode::Overwrite,
-                    attributes: json_content_type(),
+                    // LocalFileSystem rejects custom put attributes.
+                    attributes: if self.local {
+                        Attributes::new()
+                    } else {
+                        json_content_type()
+                    },
                     ..Default::default()
                 };
 
@@ -2301,6 +2407,18 @@ impl Storage for DynoStore {
 
                         let txn_detail = current_epoch.get_mut();
 
+                        // A terminal txn at this epoch being re-begun (classic
+                        // clients reuse the epoch across transactions) must not
+                        // leak its previous incarnation's payload into the new
+                        // one. Aborted ranges already moved to `meta.aborted`
+                        // at txn_end; this also scrubs any pre-fix state.
+                        if txn_detail.state.is_some_and(|state| {
+                            matches!(state, TxnState::Committed | TxnState::Aborted)
+                        }) {
+                            txn_detail.produces.clear();
+                            txn_detail.offsets.clear();
+                        }
+
                         let mut results = vec![];
 
                         for topic in topics {
@@ -2624,6 +2742,33 @@ impl Storage for DynoStore {
                                 }
                             }
 
+                            // Move an aborting txn's produced ranges into the
+                            // partition-level aborted index: the index must
+                            // outlive this txn detail (a same-epoch re-begin
+                            // resets `produces`), and terminal txns must not
+                            // linger as unprepared "overlaps" for later
+                            // transactions on the same partitions.
+                            if txn_id.state == TxnState::PrepareAbort {
+                                for (topic, partitions) in txn_detail.produces.iter() {
+                                    for (partition, offset_range) in partitions.iter() {
+                                        let Some(offset_range) = offset_range else {
+                                            continue;
+                                        };
+
+                                        meta.aborted
+                                            .entry(topic.to_owned())
+                                            .or_default()
+                                            .entry(*partition)
+                                            .or_default()
+                                            .push(AbortedTxnRange {
+                                                producer: txn_id.producer_id,
+                                                offset_start: offset_range.offset_start,
+                                                offset_end: offset_range.offset_end,
+                                            });
+                                    }
+                                }
+                            }
+
                             txn_detail.produces.clear();
                             txn_detail.offsets.clear();
                             _ = txn_detail.started_at.take();
@@ -2675,7 +2820,52 @@ impl Storage for DynoStore {
         Ok(())
     }
 
-    async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
+    async fn maintain_transactions(&self, now: SystemTime) -> Result<()> {
+        let expired: Vec<(String, i64, i16)> = self
+            .meta
+            .with(&self.object_store, move |meta| {
+                let mut expired = Vec::new();
+                for (transaction_id, txn) in &meta.transactions {
+                    for (epoch, detail) in &txn.epochs {
+                        if matches!(
+                            detail.state,
+                            Some(TxnState::Committed) | Some(TxnState::Aborted)
+                        ) {
+                            continue;
+                        }
+                        if let Some(started_at) = detail.started_at {
+                            let timeout =
+                                Duration::from_millis(detail.transaction_timeout_ms.max(0) as u64);
+                            if now
+                                .duration_since(started_at)
+                                .map(|elapsed| elapsed > timeout)
+                                .unwrap_or(false)
+                            {
+                                expired.push((transaction_id.clone(), txn.producer, *epoch));
+                            }
+                        }
+                    }
+                }
+                Ok(expired)
+            })
+            .await?;
+
+        // Abort each timed-out transaction through the normal end path.
+        for (transaction_id, producer_id, producer_epoch) in expired {
+            if let Err(err) = self
+                .txn_end(&transaction_id, producer_id, producer_epoch, false)
+                .await
+            {
+                tracing::error!(
+                    ?err,
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    "sweep abort failed"
+                );
+            }
+        }
+
         Ok(())
     }
 

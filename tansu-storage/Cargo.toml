@@ -11,9 +11,10 @@ repository.workspace = true
 version.workspace = true
 
 [features]
-default = ["dynostore", "libsql", "postgres", "slatedb", "turso"]
+default = ["dynostore", "libsql", "nvme", "postgres", "slatedb", "turso"]
 dynostore = ["dep:object_store"]
 libsql = ["dep:libsql", "dep:deadpool"]
+nvme = ["dep:crc-fast", "dep:object_store"]
 postgres = ["dep:tokio-postgres", "dep:deadpool", "dep:deadpool-postgres", "dep:tokio-postgres-rustls"]
 slatedb = ["dep:object_store", "dep:postcard", "dep:slatedb"]
 turso = ["dep:turso"]
@@ -28,6 +29,7 @@ bytes.workspace = true
 cached.workspace = true
 console.workspace = true
 chrono.workspace = true
+crc-fast = { workspace = true, optional = true }
 deadpool = { workspace = true, optional = true }
 deadpool-postgres = { workspace = true, optional = true }
 futures-core.workspace = true

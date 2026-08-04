@@ -444,6 +444,23 @@ order by
     p.id,
     pe.epoch;
 
+-- Aborted-transaction ranges per topic partition, decoupled from the
+-- producing txn's lifecycle: classic clients re-begin at the same
+-- (txn, producer epoch), reusing the txn_detail row and resetting its
+-- txn_topition / txn_produce_offset rows, so the read_committed aborted
+-- index cannot live there. Populated at abort in end_in_tx.
+create table if not exists txn_aborted_range (
+    id int generated always as identity primary key,
+    topition int references topition (id) on delete cascade,
+    producer bigint not null,
+    offset_start bigint not null,
+    offset_end bigint not null,
+    last_updated timestamp default current_timestamp not null,
+    created_at timestamp default current_timestamp not null
+);
+
+create index if not exists txn_aborted_range_topition_offset_end on txn_aborted_range (topition, offset_end);
+
 create table if not exists txn_offset_commit (
     id int generated always as identity primary key,
     txn_detail int references txn_detail (id) on delete cascade,

@@ -64,6 +64,12 @@ pub(super) struct OptiCon<D> {
     tags: TagSet,
     attributes: Attributes,
     data_version: Arc<Mutex<Option<DataVersion<D>>>>,
+    // Single-node local backend: object stores without conditional-put support
+    // (e.g. LocalFileSystem) can't do optimistic concurrency. Since a single
+    // broker has no external writers, `local` serializes `with_mut` in-process
+    // and overwrites unconditionally instead.
+    local: bool,
+    serialize: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<D> OptiCon<D> {
@@ -73,7 +79,14 @@ impl<D> OptiCon<D> {
             tags: Default::default(),
             attributes: Default::default(),
             data_version: Default::default(),
+            local: false,
+            serialize: Default::default(),
         }
+    }
+
+    pub(super) fn local(mut self, local: bool) -> Self {
+        self.local = local;
+        self
     }
 }
 
@@ -246,6 +259,52 @@ where
                 ],
             );
         };
+
+        if self.local {
+            // Single-node local backend: no external writers, and LocalFileSystem
+            // has no conditional put — serialize in-process and overwrite.
+            let _serialize = self.serialize.lock().await;
+
+            let (outcome, dv) = self.data_version.lock().map(|guard| {
+                let mut dv = guard.clone().unwrap_or_default();
+                let outcome = f(&mut dv.data);
+                (outcome, dv)
+            })?;
+
+            let payload = serde_json::to_vec(&dv.data)
+                .map(Bytes::from)
+                .map(PutPayload::from)?;
+
+            let opts = PutOptions {
+                mode: PutMode::Overwrite,
+                tags: self.tags.clone(),
+                attributes: self.attributes.clone(),
+                ..Default::default()
+            };
+
+            let put_result = object_store
+                .put_opts(&self.path, payload, opts)
+                .await
+                .inspect_err(|error| {
+                    debug!(?error);
+                    on_error(error)
+                })?;
+
+            return self
+                .data_version
+                .lock()
+                .map_err(Into::into)
+                .map(|mut guard| {
+                    guard.replace(DataVersion {
+                        data: dv.data,
+                        version: Some(UpdateVersion {
+                            e_tag: put_result.e_tag,
+                            version: put_result.version,
+                        }),
+                    })
+                })
+                .and(outcome);
+        }
 
         loop {
             REQUESTS.add(1, &[KeyValue::new("method", "with_mut_loop")]);

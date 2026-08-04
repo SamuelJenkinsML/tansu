@@ -1120,6 +1120,26 @@ impl Postgres {
             for txn in txns {
                 debug!(?txn);
 
+                // Move an aborting txn's produced ranges into the
+                // partition-level txn_aborted_range index before clearing:
+                // the index must outlive this txn detail (a same-epoch
+                // re-begin reuses it), so read_committed fetches keep
+                // reporting the aborted ranges via aborted_transactions.
+                if txn.status == TxnState::PrepareAbort {
+                    _ = self
+                        .tx_prepare_execute(
+                            tx,
+                            "txn_aborted_range_insert_from_produce.sql",
+                            &[
+                                &self.cluster,
+                                &txn.name,
+                                &txn.producer_id,
+                                &txn.producer_epoch,
+                            ],
+                        )
+                        .await?;
+                }
+
                 _ = self
                     .tx_prepare_execute(
                         tx,
@@ -2055,6 +2075,40 @@ impl Storage for Postgres {
         debug!(batches_len = batches.len());
 
         Ok(batches)
+    }
+
+    #[instrument(skip_all)]
+    async fn aborted_transactions(
+        &self,
+        topition: &Topition,
+        fetch_offset: i64,
+    ) -> Result<Vec<tansu_sans_io::fetch_response::AbortedTransaction>> {
+        debug!(cluster = self.cluster, ?topition, fetch_offset);
+        let c = self.connection().await?;
+        let topic = self.base_topic(topition.topic()).await?;
+        let partition = topition.partition();
+
+        let rows = self
+            .prepare_query(
+                &c,
+                "aborted_transactions_select.sql",
+                &[&self.cluster, &topic, &partition, &fetch_offset],
+            )
+            .await
+            .inspect_err(|err| error!(?topition, ?err))?;
+
+        let mut aborted = Vec::with_capacity(rows.len());
+        for row in rows {
+            let producer_id = row.try_get::<_, i64>(0)?;
+            let first_offset = row.try_get::<_, i64>(1)?;
+            aborted.push(
+                tansu_sans_io::fetch_response::AbortedTransaction::default()
+                    .producer_id(producer_id)
+                    .first_offset(first_offset),
+            );
+        }
+
+        Ok(aborted)
     }
 
     #[instrument(skip_all)]
@@ -3658,7 +3712,43 @@ impl Storage for Postgres {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
+        let expired: Vec<(String, i64, i16)> = {
+            let c = self.connection().await?;
+            self.prepare_query(&c, "txn_expired_select.sql", &[&self.cluster])
+                .await
+                .inspect_err(|err| error!(?err))?
+                .into_iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get::<_, String>(0)?,
+                        row.try_get::<_, i64>(1)?,
+                        row.try_get::<_, i16>(2)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        // Abort each timed-out transaction through the normal end path (writes
+        // abort control markers, advances the LSO, and retains the aborted
+        // ranges for read_committed).
+        for (transaction_id, producer_id, producer_epoch) in expired {
+            debug!(
+                cluster = self.cluster,
+                transaction_id, producer_id, producer_epoch, "sweep abort"
+            );
+            if let Err(err) = self
+                .txn_end(&transaction_id, producer_id, producer_epoch, false)
+                .await
+            {
+                error!(
+                    ?err,
+                    transaction_id, producer_id, producer_epoch, "sweep abort failed"
+                );
+            }
+        }
+
         Ok(())
     }
 

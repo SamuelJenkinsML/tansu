@@ -1570,6 +1570,289 @@ where
     Ok(())
 }
 
+// A transaction that aborts, then re-begins at the same (txn id, epoch) — the
+// classic-protocol client flow (librdkafka reuses the producer epoch across
+// transactions) — must still be able to commit: terminal txns must not
+// deadlock txn_end's overlap resolution, the LSO must advance past the commit
+// marker, and the aborted range must survive in the read_committed index.
+//
+pub async fn abort_then_commit_same_partition<G>(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    let num_partitions = 6;
+
+    let topic_id = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(num_partitions)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let partition_index = rng().random_range(0..num_partitions);
+    let topition = Topition::new(topic_name.clone(), partition_index);
+    let num_records = 3i32;
+    let transaction_timeout_ms = 10_000;
+
+    let transaction: String = alphanumeric_string(10);
+    let producer = sc
+        .init_producer(
+            Some(transaction.as_str()),
+            transaction_timeout_ms,
+            Some(-1),
+            Some(-1),
+        )
+        .await?;
+
+    for incarnation in 0..2 {
+        let add_partitions = sc
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: [AddPartitionsToTxnTopic::default()
+                    .name(topic_name.clone())
+                    .partitions(Some([partition_index].into()))]
+                .into(),
+            })
+            .await?;
+
+        assert_eq!(
+            [AddPartitionsToTxnTopicResult::default()
+                .name(topic_name.clone())
+                .results_by_partition(Some(
+                    [AddPartitionsToTxnPartitionResult::default()
+                        .partition_index(partition_index)
+                        .partition_error_code(ErrorCode::None.into())]
+                    .into()
+                ))],
+            add_partitions.zero_to_three()
+        );
+
+        for record in 0..num_records {
+            // Idempotent sequences continue across txn incarnations at the
+            // same (producer id, epoch).
+            let base_sequence = incarnation * num_records + record;
+
+            let batch = inflated::Batch::builder()
+                .record(
+                    Record::builder()
+                        .key(Bytes::copy_from_slice(alphanumeric_string(15).as_bytes()).into())
+                        .value(Bytes::copy_from_slice(alphanumeric_string(15).as_bytes()).into()),
+                )
+                .attributes(BatchAttribute::default().transaction(true).into())
+                .producer_id(producer.id)
+                .producer_epoch(producer.epoch)
+                .base_sequence(base_sequence)
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = sc
+                .produce(Some(transaction.as_str()), &topition, batch)
+                .await
+                .inspect_err(|err| error!(?err, incarnation, base_sequence))?;
+        }
+
+        let committed = incarnation == 1;
+
+        if committed {
+            // The open second incarnation pins the LSO at its first offset,
+            // past the aborted incarnation and its marker.
+            let stage = sc.offset_stage(&topition).await?;
+            assert_eq!(i64::from(num_records) + 1, stage.last_stable());
+        }
+
+        assert_eq!(
+            ErrorCode::None,
+            sc.txn_end(transaction.as_str(), producer.id, producer.epoch, committed)
+                .await
+                .inspect_err(|err| error!(?err, incarnation, committed))?
+        );
+    }
+
+    // 3 aborted + marker + 3 committed + marker.
+    let high_watermark = i64::from(num_records) * 2 + 2;
+
+    for isolation_level in [
+        IsolationLevel::ReadUncommitted,
+        IsolationLevel::ReadCommitted,
+    ] {
+        let list_offsets = sc
+            .list_offsets(isolation_level, &[(topition.clone(), ListOffset::Latest)])
+            .await
+            .inspect_err(|err| error!(?err, ?isolation_level))?;
+
+        assert_eq!(ErrorCode::None, list_offsets[0].1.error_code);
+
+        // Pre-fix, the commit deadlocked in PrepareCommit behind the terminal
+        // aborted overlap, pinning read_committed at the second incarnation's
+        // first offset forever.
+        assert_eq!(
+            Some(high_watermark),
+            list_offsets[0].1.offset,
+            "{isolation_level:?}"
+        );
+    }
+
+    let stage = sc.offset_stage(&topition).await?;
+    assert_eq!(stage.high_watermark(), stage.last_stable());
+
+    // The aborted incarnation's range survives the same-epoch commit.
+    let aborted = sc.aborted_transactions(&topition, 0).await?;
+    assert_eq!(1, aborted.len());
+    assert_eq!(producer.id, aborted[0].producer_id);
+    assert_eq!(0, aborted[0].first_offset);
+
+    assert_eq!(
+        ErrorCode::None,
+        sc.delete_topic(&TopicId::from(topic_id)).await?
+    );
+
+    Ok(())
+}
+
+// The aborted range must stay visible to read_committed consumers while the
+// same (txn id, epoch) is re-begun and producing again — not only after the
+// new incarnation terminates.
+//
+pub async fn aborted_index_visible_during_rebegin<G>(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    let num_partitions = 6;
+
+    let topic_id = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(num_partitions)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let partition_index = rng().random_range(0..num_partitions);
+    let topition = Topition::new(topic_name.clone(), partition_index);
+    let num_records = 3i32;
+    let transaction_timeout_ms = 10_000;
+
+    let transaction: String = alphanumeric_string(10);
+    let producer = sc
+        .init_producer(
+            Some(transaction.as_str()),
+            transaction_timeout_ms,
+            Some(-1),
+            Some(-1),
+        )
+        .await?;
+
+    let produce_incarnation = async |incarnation: i32| -> Result<()> {
+        _ = sc
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: [AddPartitionsToTxnTopic::default()
+                    .name(topic_name.clone())
+                    .partitions(Some([partition_index].into()))]
+                .into(),
+            })
+            .await?;
+
+        for record in 0..num_records {
+            let batch = inflated::Batch::builder()
+                .record(
+                    Record::builder()
+                        .key(Bytes::copy_from_slice(alphanumeric_string(15).as_bytes()).into())
+                        .value(Bytes::copy_from_slice(alphanumeric_string(15).as_bytes()).into()),
+                )
+                .attributes(BatchAttribute::default().transaction(true).into())
+                .producer_id(producer.id)
+                .producer_epoch(producer.epoch)
+                .base_sequence(incarnation * num_records + record)
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = sc
+                .produce(Some(transaction.as_str()), &topition, batch)
+                .await?;
+        }
+
+        Ok(())
+    };
+
+    // Incarnation 1: produce and abort.
+    produce_incarnation(0).await?;
+    assert_eq!(
+        ErrorCode::None,
+        sc.txn_end(transaction.as_str(), producer.id, producer.epoch, false)
+            .await?
+    );
+
+    let aborted = sc.aborted_transactions(&topition, 0).await?;
+    assert_eq!(1, aborted.len());
+    assert_eq!(producer.id, aborted[0].producer_id);
+    assert_eq!(0, aborted[0].first_offset);
+
+    // Incarnation 2 is open: the aborted index must still report
+    // incarnation 1 to a concurrent read_committed consumer.
+    produce_incarnation(1).await?;
+
+    let aborted = sc.aborted_transactions(&topition, 0).await?;
+    assert_eq!(
+        1,
+        aborted.len(),
+        "aborted range invisible while the same epoch is re-begun"
+    );
+    assert_eq!(producer.id, aborted[0].producer_id);
+    assert_eq!(0, aborted[0].first_offset);
+
+    assert_eq!(
+        ErrorCode::None,
+        sc.txn_end(transaction.as_str(), producer.id, producer.epoch, true)
+            .await?
+    );
+
+    let aborted = sc.aborted_transactions(&topition, 0).await?;
+    assert_eq!(1, aborted.len());
+
+    let stage = sc.offset_stage(&topition).await?;
+    assert_eq!(stage.high_watermark(), stage.last_stable());
+    assert_eq!(i64::from(num_records) * 2 + 2, stage.high_watermark());
+
+    assert_eq!(
+        ErrorCode::None,
+        sc.delete_topic(&TopicId::from(topic_id)).await?
+    );
+
+    Ok(())
+}
+
 #[cfg(feature = "postgres")]
 mod pg {
     use std::sync::Arc;
@@ -1586,6 +1869,36 @@ mod pg {
             node,
             Url::parse("tcp://127.0.0.1/")?,
             None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn abort_then_commit_same_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::abort_then_commit_same_partition(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn aborted_index_visible_during_rebegin() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::aborted_index_visible_during_rebegin(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -1697,6 +2010,36 @@ mod in_memory {
             node,
             Url::parse("tcp://127.0.0.1/")?,
             None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn abort_then_commit_same_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::abort_then_commit_same_partition(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn aborted_index_visible_during_rebegin() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::aborted_index_visible_during_rebegin(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -1919,6 +2262,147 @@ mod slatedb {
             node,
             Url::parse("tcp://127.0.0.1/")?,
             None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn simple_txn_commit_offset_abort() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::simple_txn_commit_offset_abort(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn simple_txn_commit_offset_commit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::simple_txn_commit_offset_commit(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn simple_txn_produce_commit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::simple_txn_produce_commit(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn simple_txn_produce_abort() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::simple_txn_produce_abort(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn with_overlap() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::with_overlap(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn init_producer_twice() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::init_producer_twice(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "nvme")]
+mod nvme {
+    use std::sync::Arc;
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<Arc<Box<dyn Storage>>> {
+        common::storage_container(
+            StorageType::Nvme,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn abort_then_commit_same_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::abort_then_commit_same_partition(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn aborted_index_visible_during_rebegin() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::aborted_index_visible_during_rebegin(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }

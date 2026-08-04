@@ -35,7 +35,10 @@ c.name = $1
 and t.name = $5
 and tp.partition = $6
 and txn_po.offset_start < $7
-and txn_d.status is not null
+-- Terminal transactions can never become prepared again: counting them
+-- here would deadlock the all(is_prepared) resolution gate in end_in_tx,
+-- pinning the last stable offset forever after any abort on the partition.
+and txn_d.status in ('BEGIN', 'PREPARE_COMMIT', 'PREPARE_ABORT')
 
 except
 
