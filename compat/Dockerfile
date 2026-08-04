@@ -23,7 +23,12 @@
 #
 # arm64: the demo cluster is Graviton throughout.
 # ---------------------------------------------------------------------------
-FROM golang:1.24-bookworm
+# Go 1.25, not 1.24: franz-go v1.21.3's go.mod declares `go >= 1.25.0`, and the
+# official images pin GOTOOLCHAIN=local, so 1.24 fails the build outright with
+#   go: ../../go.mod requires go >= 1.25.0 (running go 1.24.13; GOTOOLCHAIN=local)
+# rather than downloading a newer toolchain. Bump this in step with
+# FRANZ_GO_VERSION.
+FROM golang:1.25-bookworm
 
 ARG LIBRDKAFKA_VERSION=v2.14.2
 ARG FRANZ_GO_VERSION=v1.21.3
