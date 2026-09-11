@@ -1,16 +1,17 @@
 ---
-# Build and push the fork's broker image to Thyme's ECR.
+# Build and push the fork's broker image: arm64 to Thyme's ECR, amd64 to GHCR.
 #
 # Trigger is `push` to main only -- never `pull_request`. This repository is
 # public, so that is what keeps a PR from an external fork from ever reaching
-# the OIDC role. The trust policy in thyme-infra
+# the OIDC role or the package-write token. The trust policy in thyme-infra
 # (terraform/modules/ci_build) is scoped to `repo:<repo>:ref:refs/heads/main`,
 # which this satisfies without widening.
 #
-# arm64 only: Thyme's demo cluster is Graviton throughout, so a multi-arch
-# manifest would be half wasted build time. Running on a native arm64 runner
-# also avoids QEMU-emulating a workspace built with codegen-units = 1 and thin
-# LTO, which is the difference between minutes and an hour.
+# ECR gets arm64 only: Thyme's demo cluster is Graviton throughout, so a
+# multi-arch manifest there would be half wasted build time. Running on a native
+# arm64 runner also avoids QEMU-emulating a workspace built with
+# codegen-units = 1 and thin LTO, which is the difference between minutes and an
+# hour. Thyme's CI needs amd64 instead, which `publish-ghcr` builds natively.
 #
 # The repo Dockerfile cross-builds a static musl binary with --all-features, so
 # nvme:// is included. Consumers pin the git-<sha> tag: a benchmark result that
@@ -74,6 +75,66 @@ jobs:
           IMAGE: ${{ steps.ecr-login.outputs.registry }}/${{ env.IMAGE_NAME }}
         run: |
           echo "### Broker image published" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "TANSU_IMAGE=${IMAGE}:git-${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Public amd64 image on GHCR, for Thyme's CI (TH-377).
+  #
+  # Thyme's e2e job runs on GitHub's x86 runners with no AWS credentials, so it
+  # can pull neither the arm64 image above nor anything from private ECR. This
+  # builds the same Dockerfile for linux/amd64 on a native x86 runner and pushes
+  # it with the workflow's own GITHUB_TOKEN: no cloud role is involved, so the
+  # push-to-main trigger is the only thing that can publish here.
+  #
+  # Separate job, not a second platform on `publish`: an ECR/OIDC failure must
+  # not block the CI image, and the two builds share no runner architecture.
+  #
+  # The package must be public for Thyme's CI to pull it anonymously. GHCR
+  # creates a new package private; flip it once in the package settings.
+  # ---------------------------------------------------------------------------
+  publish-ghcr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR image names must be lowercase, and the owner here is not.
+      - name: Image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          tags: |
+            ${{ steps.image.outputs.name }}:git-${{ github.sha }}
+            ${{ steps.image.outputs.name }}:latest
+          cache-from: type=registry,ref=${{ steps.image.outputs.name }}:buildcache-amd64
+          cache-to: type=registry,ref=${{ steps.image.outputs.name }}:buildcache-amd64,mode=max,image-manifest=true,oci-mediatypes=true
+
+      - name: Report pinned tag
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          echo "### CI broker image published (amd64)" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "TANSU_IMAGE=${IMAGE}:git-${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
