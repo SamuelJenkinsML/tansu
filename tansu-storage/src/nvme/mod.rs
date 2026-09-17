@@ -1682,7 +1682,9 @@ impl Storage for Engine {
                                         .value(config.value.clone())
                                         .read_only(false)
                                         .is_default(None)
-                                        .config_source(Some(ConfigSource::DefaultConfig.into()))
+                                        .config_source(Some(
+                                            ConfigSource::DynamicTopicConfig.into(),
+                                        ))
                                         .is_sensitive(false)
                                         .synonyms(Some([].into()))
                                         .config_type(Some(ConfigType::String.into()))

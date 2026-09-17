@@ -1447,6 +1447,11 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<Option<ScramCredential>>;
 
     /// Query the configuration of a resource in this storage.
+    ///
+    /// Topic configs returned here were set on the topic (by CreateTopics or
+    /// AlterConfigs), so implementations report them as `DynamicTopicConfig`.
+    /// Clients such as librdkafka derive `is_default` from the source, and
+    /// `DefaultConfig` would make an explicit topic setting read as inherited.
     async fn describe_config(
         &self,
         name: &str,
