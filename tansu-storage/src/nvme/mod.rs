@@ -1105,6 +1105,31 @@ impl Storage for Engine {
 
         let batch_bytes = Bytes::from(deflated);
 
+        // A transactional batch is appended and its range recorded under the
+        // coordination lock, so no end of its transaction can fall between
+        // the two. A rollback forced by a new producer used to land there:
+        // it ended the transaction without the batch's range, so the batch's
+        // pin on the last stable offset was never released and every
+        // read_committed reader of the partition waited behind it for good.
+        // The group-commit fsync is still awaited outside the lock.
+        let mut txn_coord = match transaction_id {
+            Some(transaction_id) if attributes.transaction => {
+                let coord = self.coord.lock().await;
+
+                if !attributes.control
+                    && let Some(transaction) = coord.transactions.get(transaction_id)
+                    && let Some(txn_detail) = transaction.epochs.get(&producer_epoch)
+                    && txn_detail.state != Some(TxnState::Begin)
+                {
+                    return Err(Error::Api(ErrorCode::InvalidTxnState));
+                }
+
+                Some(coord)
+            }
+
+            _ => None,
+        };
+
         let (offset, offset_end, ack) = {
             let mut inner = partition.inner.lock()?;
 
@@ -1174,20 +1199,7 @@ impl Storage for Engine {
             (offset, offset_end, ack)
         };
 
-        // Ack only after the group-commit fsync: the high watermark must
-        // never expose data a crash would lose.
-        ack.await
-            .map_err(|_| Error::Message("nvme segment flusher dropped".into()))??;
-
-        {
-            let mut inner = partition.inner.lock()?;
-            inner.durable_offset = inner.durable_offset.max(offset_end + 1);
-        }
-
-        if let Some(transaction_id) = transaction_id
-            && attributes.transaction
-        {
-            let mut coord = self.coord.lock().await;
+        if let (Some(transaction_id), Some(coord)) = (transaction_id, txn_coord.as_mut()) {
             coord.record_txn_produce(
                 transaction_id,
                 producer_epoch,
@@ -1197,6 +1209,17 @@ impl Storage for Engine {
                 offset_end,
                 attributes.control,
             )?;
+        }
+        drop(txn_coord);
+
+        // Ack only after the group-commit fsync: the high watermark must
+        // never expose data a crash would lose.
+        ack.await
+            .map_err(|_| Error::Message("nvme segment flusher dropped".into()))??;
+
+        {
+            let mut inner = partition.inner.lock()?;
+            inner.durable_offset = inner.durable_offset.max(offset_end + 1);
         }
 
         partition.notify.notify_waiters();
@@ -2734,6 +2757,62 @@ mod tests {
             .replication_factor(0)
             .assignments(Some([].into()))
             .configs(Some([].into()))
+    }
+
+    // A zombie's batch can pass the produce checks before a new producer takes
+    // its transactional id over, and land after the rollback that takeover
+    // forces. Its records then belong to no transaction anyone will end.
+    #[tokio::test]
+    async fn a_batch_racing_a_takeover_does_not_pin_the_last_stable_offset() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = open(dir.path()).await?;
+        let topition = Topition::new("raced", 0);
+        _ = engine.create_topic(topic("raced", 1), false).await?;
+
+        for round in 0..5 {
+            // Given an open transaction with a batch on its way
+            let zombie = engine
+                .init_producer(Some("txn-raced"), 10_000, Some(-1), Some(-1))
+                .await?;
+            _ = engine
+                .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                    transaction_id: "txn-raced".into(),
+                    producer_id: zombie.id,
+                    producer_epoch: zombie.epoch,
+                    topics: [
+                        tansu_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic::default()
+                            .name("raced".into())
+                            .partitions(Some([0].into())),
+                    ]
+                    .into(),
+                })
+                .await?;
+
+            // When a new producer takes the transactional id over while it is
+            // in flight
+            let (_produced, taken_over) = tokio::join!(
+                engine.produce(
+                    Some("txn-raced"),
+                    &topition,
+                    batch(zombie.id, zombie.epoch, 0, true, "zombie")?,
+                ),
+                engine.init_producer(Some("txn-raced"), 10_000, Some(-1), Some(-1)),
+            );
+            _ = taken_over?;
+
+            // Then every record is either in a decided transaction or refused:
+            // a read_committed reader is not held below the log's end
+            let partition = engine.partition_if_exists(&topition)?.expect("partition");
+            let inner = partition.inner.lock()?;
+            assert_eq!(
+                inner.last_stable(),
+                inner.high_watermark(),
+                "round {round}: open transactions {:?}",
+                inner.open_txns,
+            );
+        }
+
+        Ok(())
     }
 
     #[tokio::test]
