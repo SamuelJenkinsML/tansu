@@ -517,9 +517,7 @@ async fn tick(
                         size
                     };
 
-                    usage = disk_usage
-                        .fetch_sub(evicted, Ordering::Relaxed)
-                        .saturating_sub(evicted);
+                    usage = super::reclaim_disk_usage(disk_usage, evicted);
 
                     if usage <= low_water {
                         break 'evict;
