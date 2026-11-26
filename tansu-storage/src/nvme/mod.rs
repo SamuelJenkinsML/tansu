@@ -311,8 +311,10 @@ impl Engine {
             _lock: recovered.lock,
         };
 
-        // Seed the disk-budget accounting from the recovered indexes
-        // (tiered entries hold no local bytes).
+        // Seed the disk-budget accounting from local segment bytes and
+        // recovered WAL files (tiered entries hold no local bytes). Without the
+        // WAL files included, finish_boot's initial snapshot would subtract the
+        // retired WAL from 0 on cold bootstrap.
         let mut usage = 0u64;
         for state in engine.partitions.read()?.values() {
             let inner = state.inner.lock()?;
@@ -322,6 +324,11 @@ impl Engine {
                 .filter(|entry| !entry.tiered)
                 .map(|entry| u64::from(entry.len))
                 .sum::<u64>();
+        }
+        let wal_dir = engine.data_dir.join("wal");
+        for seq in wal::wal_seqs(&wal_dir)? {
+            let path = wal_dir.join(format!("{seq:020}.{}", wal::WAL_SUFFIX));
+            usage += std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         }
         engine
             .disk_usage
@@ -476,9 +483,7 @@ impl Engine {
                 let path = wal_dir.join(format!("{seq:020}.{}", wal::WAL_SUFFIX));
                 let reclaimed = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
                 _ = std::fs::remove_file(&path).inspect_err(|err| warn!(seq, ?err, "wal retire"));
-                _ = self
-                    .disk_usage
-                    .fetch_sub(reclaimed, std::sync::atomic::Ordering::Relaxed);
+                _ = reclaim_disk_usage(&self.disk_usage, reclaimed);
             }
         }
 
@@ -614,9 +619,7 @@ impl Engine {
                 let reclaimed = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
                 _ = std::fs::remove_file(path)
                     .inspect_err(|err| warn!(?path, ?err, "retention delete"));
-                _ = self
-                    .disk_usage
-                    .fetch_sub(reclaimed, std::sync::atomic::Ordering::Relaxed);
+                _ = reclaim_disk_usage(&self.disk_usage, reclaimed);
             }
 
             debug!(?topition, new_start, deleted = files.len(), "retention");
@@ -989,15 +992,14 @@ impl Storage for Engine {
                 let bytes = inner
                     .batches
                     .values()
+                    .filter(|entry| !entry.tiered)
                     .map(|entry| u64::from(entry.len))
                     .sum::<u64>();
                 (inner.dir.clone(), bytes)
             };
 
             _ = std::fs::remove_dir_all(&dir).inspect_err(|err| warn!(?dir, ?err));
-            _ = self
-                .disk_usage
-                .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+            _ = reclaim_disk_usage(&self.disk_usage, bytes);
         }
 
         self.group_offsets
@@ -2709,6 +2711,25 @@ impl Storage for Engine {
     }
 }
 
+/// Subtract `bytes` from `disk_usage` without wrapping below zero. Raw
+/// `fetch_sub` wraps `u64` to ~18 EB if accounting drifts by even one header
+/// byte, permanently tripping `disk_budget_bytes` on every subsequent produce.
+pub(crate) fn reclaim_disk_usage(disk_usage: &std::sync::atomic::AtomicU64, bytes: u64) -> u64 {
+    let mut current = disk_usage.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let updated = current.saturating_sub(bytes);
+        match disk_usage.compare_exchange_weak(
+            current,
+            updated,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return updated,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tansu_sans_io::record::Record;
@@ -3469,5 +3490,63 @@ mod tests {
     fn config_rejects_bad_fsync() {
         let url = Url::parse("nvme:///data?fsync=sometimes").expect("url");
         assert!(Config::from_url(&url).is_err());
+    }
+
+    #[tokio::test]
+    async fn boot_wal_retire_does_not_underflow_disk_budget() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let topition = Topition::new("budget", 0);
+        let config = Config {
+            disk_budget_bytes: 64 * 1024 * 1024,
+            ..Config::default()
+        };
+
+        {
+            let engine = Engine::open(
+                "test-cluster",
+                111,
+                dir.path(),
+                Url::parse("tcp://127.0.0.1:9092").expect("url"),
+                None,
+                config.clone(),
+            )
+            .await?;
+
+            // Writes WAL records with zero local segment bytes (mirrors cold
+            // bootstrap where every recovered segment is tiered and only the
+            // downloaded WAL sits on disk when finish_boot snapshots).
+            _ = engine.create_topic(topic("budget", 1), false).await?;
+        }
+
+        let engine = Engine::open(
+            "test-cluster",
+            111,
+            dir.path(),
+            Url::parse("tcp://127.0.0.1:9092").expect("url"),
+            None,
+            config.clone(),
+        )
+        .await?;
+
+        let usage = engine.disk_usage.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            usage < config.disk_budget_bytes,
+            "disk_usage underflowed or exceeded budget after boot WAL retire: {usage}"
+        );
+
+        let pid = engine.init_producer(None, 0, Some(-1), Some(-1)).await?;
+        _ = engine
+            .produce(None, &topition, batch(pid.id, pid.epoch, 0, false, "ok")?)
+            .await?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn reclaim_disk_usage_saturates_at_zero() {
+        let usage = std::sync::atomic::AtomicU64::new(128);
+        assert_eq!(28, reclaim_disk_usage(&usage, 100));
+        assert_eq!(0, reclaim_disk_usage(&usage, 500));
+        assert_eq!(0, usage.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
